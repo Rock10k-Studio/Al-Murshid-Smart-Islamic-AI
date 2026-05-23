@@ -1,0 +1,6 @@
+{
+  "name": "Al-Manara Islamic AI",
+  "description": "مساعد إسلامي ذكي يعمل بنظام هجين أوفلاين وأونلاين للبحث الدلالي والموثوق في القرآن، الحديث، الفتاوى والأذكار.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
