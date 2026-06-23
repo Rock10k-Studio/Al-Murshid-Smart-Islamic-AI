@@ -1,46 +1,21 @@
 <div align="center">
-<img width="1200" height="475" alt="Rock10k Studio Banner" src="" />
-
-# 🚀 Rock10k Studio App
-
-منصة تطبيق ذكية تم تطويرها بواسطة Rock10k Studio، جاهزة للتشغيل والتطوير والنشر على Android 📱
+<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
 </div>
 
-هذا المشروع عبارة عن تطبيق Android حديث يعتمد على الذكاء الاصطناعي (Gemini API) مع بنية قابلة للتوسعة والتطوير بسهولة. تم تصميمه ليكون سريع، منظم، وقابل للاستخدام في بيئة إنتاج حقيقية (Production Ready)، مع مرونة كبيرة لإضافة ميزات مستقبلية أو تحسينات حسب الحاجة.
+# Run and deploy your AI Studio app
 
-## ⚙️ المتطلبات  
-Android Studio آخر إصدار، دعم Java أو Kotlin، اتصال بالإنترنت، ومفتاح Gemini API صالح.
+This contains everything you need to run your app locally.
 
-## 🚀 طريقة التشغيل  
-افتح Android Studio ثم اختر Open Project وحدد مجلد المشروع. بعد ذلك انتظر حتى يتم مزامنة Gradle بشكل كامل. أنشئ ملف باسم `.env` داخل جذر المشروع، وأضف بداخله:  
-GEMINI_API_KEY=YOUR_API_KEY_HERE  
+View your app in AI Studio: https://ai.studio/apps/1442b5fe-04e5-4ecb-ab73-8246ae0ccc2c
 
-بعد ذلك افتح ملف `build.gradle.kts` وإذا وجدت السطر التالي قم بحذفه أو تعطيله:  
-signingConfig = signingConfigs.getByName("debugConfig")  
+## Run Locally
 
-ثم شغّل التطبيق على جهاز Android حقيقي أو Emulator.
+**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
 
-## 🧠 مميزات المشروع  
-يدعم تكامل مباشر مع Gemini AI، بنية نظيفة وسهلة التعديل، قابلية عالية للتوسع، أداء سريع، وإمكانية تطويره ليصبح تطبيق احترافي متعدد المنصات مستقبلاً.
 
-## 🏗️ هيكل المشروع  
-app/  
-├── src/  
-│   ├── main/  
-│   │   ├── java/  
-│   │   ├── res/  
-│   │   └── AndroidManifest.xml  
-├── build.gradle.kts  
-└── proguard-rules.pro  
-
-## 🔐 الأمان  
-يجب عدم رفع ملف `.env` على GitHub، وعدم مشاركة API Key مع أي طرف آخر، واعتماد متغيرات البيئة دائمًا في المشاريع الإنتاجية.
-
-## 🛡️ الحقوق  
-© 2026 Rock10k Studio. جميع الحقوق محفوظة بالكامل.  
-هذا المشروع ملك حصري لـ Rock10k Studio، ولا يُسمح بنسخه أو إعادة استخدامه أو توزيعه أو استغلاله تجاريًا بدون إذن رسمي مسبق.
-
-## 🚀 تطوير مستقبلي  
-دعم واجهات UI متقدمة، تحسين الأداء باستخدام caching، إضافة نظام plugins، ودعم تشغيل متعدد المنصات (Android / Web / Desktop).
-
-تم تطوير هذا المشروع بعقلية هندسية احترافية من طرف Rock10k Studio 🚀
+1. Open Android Studio
+2. Select **Open** and choose the directory containing this project
+3. Allow Android Studio to fix any incompatibilities as it imports the project.
+4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
+5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
+6. Run the app on an emulator or physical device

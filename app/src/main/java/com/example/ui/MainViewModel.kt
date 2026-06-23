@@ -2,1050 +2,892 @@ package com.example.ui
 
 import android.app.Application
 import android.content.Context
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.api.DocumentParser
 import com.example.api.GeminiApiClient
 import com.example.data.AppDatabase
 import com.example.data.IslamicContentEntity
 import com.example.data.IslamicRepository
-import com.example.data.IslamicInitialData
-import com.example.data.SearchResult
+import com.example.data.QuranProgressEntity
 import com.example.nlp.ArabicNlpHelper
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-sealed interface UiState {
-    object Idle : UiState
-    object Loading : UiState
-    data class Success(val results: List<SearchResult>) : UiState
-    data class Error(val message: String) : UiState
-}
+import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipEntry
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val db = AppDatabase.getDatabase(application)
-    private val repository = IslamicRepository(db.islamicContentDao())
+    private val context = application.applicationContext
+    private val database = AppDatabase.getDatabase(context)
+    val repository = IslamicRepository(database, context)
 
-    // SharedPreferences for local settings persistence
-    private val prefs = application.getSharedPreferences("islamic_ai_settings", Context.MODE_PRIVATE)
+    // --- UI States ---
 
-    // UI States
-    private val _uiState = MutableStateFlow<UiState>(UiState.Idle)
-    val uiState: StateFlow<UiState> = _uiState.asStateFlow()
+    val searchQuery = MutableStateFlow("")
+    val selectedCategory = MutableStateFlow("all") // "all", "quran", "hadith", "fatawa", "user_docs"
 
-    private val _currentTab = MutableStateFlow("all") // "all", "quran", "hadith", "fatwa", "adhkar", "favorites"
-    val currentTab: StateFlow<String> = _currentTab.asStateFlow()
+    // Custom Scored Results for UI search
+    private val _searchResults = MutableStateFlow<List<ScoredResult>>(emptyList())
+    val searchResults: StateFlow<List<ScoredResult>> = _searchResults.asStateFlow()
 
-    private val _searchMode = MutableStateFlow(SearchMode.HYBRID) // HYBRID or LOCAL
-    val searchMode: StateFlow<SearchMode> = _searchMode.asStateFlow()
+    private val prefs = context.getSharedPreferences("almanara_prefs", Context.MODE_PRIVATE)
 
-    private val _searchQuery = MutableStateFlow("")
-    val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
+    // --- Search History Tracking ---
+    val recentQueries = MutableStateFlow<List<String>>(
+        prefs.getString("recent_search_queries", "")
+            ?.split("\n")
+            ?.filter { it.isNotBlank() }
+            ?: emptyList()
+    )
 
-    private val _isInternetAvailable = MutableStateFlow(false)
-    val isInternetAvailable: StateFlow<Boolean> = _isInternetAvailable.asStateFlow()
-
-    // Key to allow users to use their custom Gemini API keys
-    private val _userApiKey = MutableStateFlow(prefs.getString("user_api_key", "") ?: "")
-    val userApiKey: StateFlow<String> = _userApiKey.asStateFlow()
-
-    // Offline intelligence package simulation states
-    private val _isOfflineModelDownloaded = MutableStateFlow(prefs.getBoolean("offline_model_downloaded", true))
-    val isOfflineModelDownloaded: StateFlow<Boolean> = _isOfflineModelDownloaded.asStateFlow()
-
-    private val _isOfflineModelDownloading = MutableStateFlow(false)
-    val isOfflineModelDownloading: StateFlow<Boolean> = _isOfflineModelDownloading.asStateFlow()
-
-    private val _offlineDownloadProgress = MutableStateFlow(0.0f)
-    val offlineDownloadProgress: StateFlow<Float> = _offlineDownloadProgress.asStateFlow()
-
-    // Required Package com.rock10k.quran.premium validation fields
-    private val _isPremiumQuranInstalled = MutableStateFlow(false)
-    val isPremiumQuranInstalled: StateFlow<Boolean> = _isPremiumQuranInstalled.asStateFlow()
-
-    private val _tempBypassRequiredPackage = MutableStateFlow(false)
-    val tempBypassRequiredPackage: StateFlow<Boolean> = _tempBypassRequiredPackage.asStateFlow()
-
-    // Multi-level AI Intelligence Modes (Simple, Standard, Advanced Ultra)
-    enum class AiMode {
-        SIMPLE,       // الوضع البسيط: إجابات مختصرة جداً، غاية في السهولة والوضوح لمبتدئين
-        STANDARD,     // الوضع القوي: إجابة منظمة، شرح متوسط، الاستشهاد بالأدلة الشرعية
-        ADVANCED_ULTRA // الوضع المتقدم جداً: تفصيل عميق، آراء المذاهب والأقوال ونقد الأدلة
+    fun addQueryToHistory(query: String) {
+        val trimmed = query.trim()
+        if (trimmed.isEmpty() || trimmed.length < 2) return
+        val currentList = recentQueries.value.toMutableList()
+        currentList.remove(trimmed)
+        currentList.add(0, trimmed)
+        val updated = currentList.take(15)
+        recentQueries.value = updated
+        prefs.edit().putString("recent_search_queries", updated.joinToString("\n")).apply()
     }
 
-    private val _aiMode = MutableStateFlow(AiMode.valueOf(prefs.getString("ai_mode", AiMode.STANDARD.name) ?: AiMode.STANDARD.name))
-    val aiMode: StateFlow<AiMode> = _aiMode.asStateFlow()
-
-    fun setAiMode(mode: AiMode) {
-        _aiMode.value = mode
-        prefs.edit().putString("ai_mode", mode.name).apply()
-        refreshCurrentResults()
+    fun removeQueryFromHistory(query: String) {
+        val updated = recentQueries.value.filter { it != query }
+        recentQueries.value = updated
+        prefs.edit().putString("recent_search_queries", updated.joinToString("\n")).apply()
     }
 
-    // Strict Shariah Verification filter
-    private val _strictShariahValidation = MutableStateFlow(prefs.getBoolean("strict_shariah_validation", false))
-    val strictShariahValidation: StateFlow<Boolean> = _strictShariahValidation.asStateFlow()
-
-    fun setStrictShariahValidation(enabled: Boolean) {
-        _strictShariahValidation.value = enabled
-        prefs.edit().putBoolean("strict_shariah_validation", enabled).apply()
-        refreshCurrentResults()
+    fun clearHistory() {
+        recentQueries.value = emptyList()
+        prefs.edit().remove("recent_search_queries").apply()
     }
 
-    // File Import background processing progress states
-    private val _isImporting = MutableStateFlow(false)
-    val isImporting: StateFlow<Boolean> = _isImporting.asStateFlow()
+    // --- Bookmarks / Favorites Management ---
+    val favoritesList: StateFlow<List<IslamicContentEntity>> = repository.allFavorites
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
 
-    private val _importStatus = MutableStateFlow("")
-    val importStatus: StateFlow<String> = _importStatus.asStateFlow()
+    val favoriteIds: StateFlow<Set<Int>> = repository.allFavorites
+        .map { list -> list.map { it.id }.toSet() }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptySet()
+        )
 
-    // Cognitive Memory Profile (الذاكرة الذكية لاهتمامات المستخدم)
-    private val _memoryInterests = MutableStateFlow<Map<String, Int>>(loadMemoryInterests())
-    val memoryInterests: StateFlow<Map<String, Int>> = _memoryInterests.asStateFlow()
-
-    private fun loadMemoryInterests(): Map<String, Int> {
-        val raw = prefs.getString("memory_interests", "") ?: ""
-        if (raw.isBlank()) return emptyMap()
-        return raw.split(";").mapNotNull {
-            val parts = it.split(":")
-            if (parts.size == 2) parts[0] to (parts[1].toIntOrNull() ?: 0) else null
-        }.toMap()
-    }
-
-    private fun recordInterestTopic(query: String) {
-        val cleanQuery = query.trim().lowercase()
-        val topic = when {
-            cleanQuery.contains("صلاة") || cleanQuery.contains("صلاه") || cleanQuery.contains("سجود") -> "فقه العبادات والصلاة"
-            cleanQuery.contains("وضوء") || cleanQuery.contains("الوضوء") || cleanQuery.contains("طهارة") -> "الطهارة والوضوء"
-            cleanQuery.contains("حديث") || cleanQuery.contains("سنة") || cleanQuery.contains("البخاري") -> "علم الحديث والسنة"
-            cleanQuery.contains("قرآن") || cleanQuery.contains("رسول") || cleanQuery.contains("آية") -> "القرآن وعلوم التنزيل"
-            cleanQuery.contains("زكاة") || cleanQuery.contains("صدقة") || cleanQuery.contains("مال") -> "الزكاة والمعاملات المالية"
-            cleanQuery.contains("شرك") || cleanQuery.contains("توحيد") || cleanQuery.contains("عقيدة") -> "العقيدة والتوحيد"
-            else -> "مواضيع فقهية عامة"
-        }
-        val current = _memoryInterests.value.toMutableMap()
-        current[topic] = (current[topic] ?: 0) + 1
-        _memoryInterests.value = current
-        val serialized = current.map { "${it.key}:${it.value}" }.joinToString(";")
-        prefs.edit().putString("memory_interests", serialized).apply()
-    }
-
-    fun clearMemoryInterests() {
-        _memoryInterests.value = emptyMap()
-        prefs.edit().putString("memory_interests", "").apply()
-    }
-
-    // Highly Customizable Settings Requested by user
-    private val _appTheme = MutableStateFlow(prefs.getString("app_theme", "system") ?: "system")
-    val appTheme: StateFlow<String> = _appTheme.asStateFlow()
-
-    private val _showTranslation = MutableStateFlow(prefs.getBoolean("show_translation", true))
-    val showTranslation: StateFlow<Boolean> = _showTranslation.asStateFlow()
-
-    private val _fontSizeMultiplier = MutableStateFlow(prefs.getFloat("font_size_multiplier", 1.0f))
-    val fontSizeMultiplier: StateFlow<Float> = _fontSizeMultiplier.asStateFlow()
-
-    private val _spiritualRemindersEnabled = MutableStateFlow(prefs.getBoolean("spiritual_reminders", true))
-    val spiritualRemindersEnabled: StateFlow<Boolean> = _spiritualRemindersEnabled.asStateFlow()
-
-    // Persistent list of custom shariah links (stored as serialized "Title|URL;Title2|URL2")
-    private val _customLinks = MutableStateFlow<List<Pair<String, String>>>(loadCustomLinks())
-    val customLinks: StateFlow<List<Pair<String, String>>> = _customLinks.asStateFlow()
-
-    private var refreshJob: Job? = null
-
-    private fun loadCustomLinks(): List<Pair<String, String>> {
-        val raw = prefs.getString("custom_shariah_links", "") ?: ""
-        if (raw.isBlank()) return emptyList()
-        return raw.split(";").mapNotNull {
-            val parts = it.split("|")
-            if (parts.size == 2) Pair(parts[0], parts[1]) else null
+    fun toggleFavorite(id: Int) {
+        viewModelScope.launch {
+            val isAlreadyFav = repository.isFavorite(id)
+            if (isAlreadyFav) {
+                repository.deleteFavorite(id)
+            } else {
+                repository.insertFavorite(id)
+            }
         }
     }
 
-    fun addCustomLink(title: String, url: String) {
-        val current = _customLinks.value.toMutableList()
-        current.removeAll { it.first == title }
-        current.add(Pair(title, url))
-        _customLinks.value = current
-        val serialized = current.joinToString(";") { "${it.first}|${it.second}" }
-        prefs.edit().putString("custom_shariah_links", serialized).apply()
-    }
+    // Gemini states
+    val aiAnswer = MutableStateFlow("")
+    val isAiLoading = MutableStateFlow(false)
+    val referencedContexts = MutableStateFlow<List<IslamicContentEntity>>(emptyList())
+    val enableWebSearch = MutableStateFlow(prefs.getBoolean("enable_web_search", true))
+    val webSources = MutableStateFlow<List<com.example.api.WebSource>>(emptyList())
+    val webQueries = MutableStateFlow<List<String>>(emptyList())
+    val pendingChatQuery = MutableStateFlow("")
 
-    fun removeCustomLink(title: String) {
-        val current = _customLinks.value.toMutableList()
-        current.removeAll { it.first == title }
-        _customLinks.value = current
-        val serialized = current.joinToString(";") { "${it.first}|${it.second}" }
-        prefs.edit().putString("custom_shariah_links", serialized).apply()
+    // --- Configurations & Customizations ---
+    val shariahPersona = MutableStateFlow(prefs.getString("shariah_persona", "balanced") ?: "balanced") // "balanced", "fiqh", "spiritual", "tafsir"
+    val temperature = MutableStateFlow(prefs.getFloat("temperature", 0.3f))
+    val relevanceThreshold = MutableStateFlow(prefs.getFloat("relevance_threshold", 0.2f))
+    val useLocalDataOnly = MutableStateFlow(prefs.getBoolean("use_local_data_only", false))
+    val customSystemPrompt = MutableStateFlow(prefs.getString("custom_system_prompt", "") ?: "")
+    val customApiKey = MutableStateFlow(prefs.getString("custom_api_key", "") ?: "")
+    val themeMode = MutableStateFlow(prefs.getString("theme_mode", "system") ?: "system") // "system", "light", "dark", "high_contrast"
+    
+    // --- Late Night Quran Reading Comfort Mode State ---
+    val isLateNightReading = MutableStateFlow(prefs.getBoolean("is_late_night_reading", false))
+    val quranReadingFontSize = MutableStateFlow(prefs.getFloat("quran_reading_font_size", 18f))
+    val nightReadingTint = MutableStateFlow(prefs.getString("night_reading_tint", "amber") ?: "amber") // "amber", "sepia", "mint", "rose"
+    
+    // --- Local Vector Database & Semantic Offline Search Mode ---
+    val useVectorSearch = MutableStateFlow(prefs.getBoolean("use_vector_search", true))
+
+    // --- Quran Progress Tracking Management ---
+    val quranProgressList: StateFlow<List<QuranProgressEntity>> = repository.allQuranProgress
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val quranProgressMap: StateFlow<Map<Int, QuranProgressEntity>> = repository.allQuranProgress
+        .map { list -> list.associateBy { it.id } }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyMap()
+        )
+
+    val quranContentList: StateFlow<List<IslamicContentEntity>> = repository.getContentByCategory("quran")
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    fun updateQuranProgress(id: Int, status: String, notes: String = "") {
+        viewModelScope.launch {
+            repository.insertOrUpdateProgress(
+                QuranProgressEntity(
+                    id = id,
+                    status = status,
+                    lastReadPosition = 0,
+                    lastUpdated = System.currentTimeMillis(),
+                    notes = notes
+                )
+            )
+        }
     }
+    
+    // Track file storage lists dynamically
+    private val _storedFiles = MutableStateFlow<Map<String, List<File>>>(emptyMap())
+    val storedFiles: StateFlow<Map<String, List<File>>> = _storedFiles.asStateFlow()
 
     init {
-        // Init checklist: verify Database and Required package installation
-        checkPremiumQuranInstallation(application)
+        // Flow persistence tracking
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                repository.checkAndSeedDatabase()
-            }
-            checkNetworkConnection()
-            // Observe changes in favorites or main data to update views dynamically
-            _currentTab.collectLatest { tab ->
-                refreshCurrentResults()
-            }
+            shariahPersona.collect { prefs.edit().putString("shariah_persona", it).apply() }
         }
-    }
-
-    enum class SearchMode {
-        HYBRID, LOCAL
-    }
-
-    // Setters for Settings Config
-    fun setUserApiKey(key: String) {
-        _userApiKey.value = key
-        prefs.edit().putString("user_api_key", key).apply()
-    }
-
-    // Simulate Downloading full Arabic smart model for totally offline queries
-    fun downloadOfflineIntelligenceModel() {
-        if (_isOfflineModelDownloaded.value || _isOfflineModelDownloading.value) return
-        _isOfflineModelDownloading.value = true
-        _offlineDownloadProgress.value = 0.0f
         viewModelScope.launch {
-            for (i in 1..100) {
-                kotlinx.coroutines.delay(15) // Smooth fast loading animation
-                _offlineDownloadProgress.value = i / 100.0f
-            }
-            // Seed the 30 premium robust offline intelligence entities into local database
-            withContext(Dispatchers.IO) {
-                val premiumEntities = IslamicInitialData.getPremiumOfflineModelEntities()
-                for (entity in premiumEntities) {
-                    repository.insert(entity)
-                }
-            }
-            _isOfflineModelDownloaded.value = true
-            prefs.edit().putBoolean("offline_model_downloaded", true).apply()
-            _isOfflineModelDownloading.value = false
-            refreshCurrentResults()
+            temperature.collect { prefs.edit().putFloat("temperature", it).apply() }
         }
-    }
-
-    fun deleteOfflineIntelligenceModel() {
-        _isOfflineModelDownloaded.value = false
-        prefs.edit().putBoolean("offline_model_downloaded", false).apply()
-        _offlineDownloadProgress.value = 0.0f
-        refreshCurrentResults()
-    }
-
-    // Checking if com.rock10k.quran.premium package is available on the device
-    fun checkPremiumQuranInstallation(context: Context) {
-        _isPremiumQuranInstalled.value = isPackageInstalled(context, "com.rock10k.quran.premium")
-    }
-
-    fun bypassRequiredPackage() {
-        _tempBypassRequiredPackage.value = true
-    }
-
-    private fun isPackageInstalled(context: Context, packageName: String): Boolean {
-        return try {
-            context.packageManager.getPackageInfo(packageName, 0)
-            true
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    // Setter for App Theme (system, light, dark)
-    fun setAppTheme(theme: String) {
-        _appTheme.value = theme
-        prefs.edit().putString("app_theme", theme).apply()
-    }
-
-    // Setter for Show Translation Toggle
-    fun toggleTranslation(show: Boolean) {
-        _showTranslation.value = show
-        prefs.edit().putBoolean("show_translation", show).apply()
-    }
-
-    // Setter for Font Size Multiplier
-    fun setFontSizeMultiplier(multiplier: Float) {
-        _fontSizeMultiplier.value = multiplier
-        prefs.edit().putFloat("font_size_multiplier", multiplier).apply()
-    }
-
-    // Setter for Spiritual Reminders Toggle
-    fun toggleSpiritualReminders(enabled: Boolean) {
-        _spiritualRemindersEnabled.value = enabled
-        prefs.edit().putBoolean("spiritual_reminders", enabled).apply()
-    }
-
-    // Clear Search History / Custom entries in Database to keep things fast
-    fun clearCachedSearchEntities() {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                // Clear extra rows that are downloaded (leaving seeded entries unchanged)
-                val all = repository.allContent.first()
-                all.forEach {
-                    if (it.id > 11 && !it.isFavorite) {
-                        repository.deleteById(it.id)
-                    }
+            relevanceThreshold.collect { prefs.edit().putFloat("relevance_threshold", it).apply() }
+        }
+        viewModelScope.launch {
+            useLocalDataOnly.collect { prefs.edit().putBoolean("use_local_data_only", it).apply() }
+        }
+        viewModelScope.launch {
+            customSystemPrompt.collect { prefs.edit().putString("custom_system_prompt", it).apply() }
+        }
+        viewModelScope.launch {
+            enableWebSearch.collect { prefs.edit().putBoolean("enable_web_search", it).apply() }
+        }
+        viewModelScope.launch {
+            customApiKey.collect { prefs.edit().putString("custom_api_key", it).apply() }
+        }
+        viewModelScope.launch {
+            themeMode.collect { prefs.edit().putString("theme_mode", it).apply() }
+        }
+        viewModelScope.launch {
+            isLateNightReading.collect { prefs.edit().putBoolean("is_late_night_reading", it).apply() }
+        }
+        viewModelScope.launch {
+            quranReadingFontSize.collect { prefs.edit().putFloat("quran_reading_font_size", it).apply() }
+        }
+        viewModelScope.launch {
+            nightReadingTint.collect { prefs.edit().putString("night_reading_tint", it).apply() }
+        }
+        viewModelScope.launch {
+            useVectorSearch.collect { prefs.edit().putBoolean("use_vector_search", it).apply() }
+        }
+
+        @OptIn(FlowPreview::class)
+        viewModelScope.launch {
+            searchQuery
+                .debounce(1500)
+                .map { it.trim() }
+                .filter { it.length >= 2 }
+                .distinctUntilChanged()
+                .collect { query ->
+                    addQueryToHistory(query)
                 }
-            }
-            refreshCurrentResults()
-        }
-    }
-
-    /**
-     * Checks if active internet is connected
-     */
-    fun checkNetworkConnection() {
-        try {
-            val connectivityManager = getApplication<Application>()
-                .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            if (connectivityManager == null) {
-                _isInternetAvailable.value = false
-                return
-            }
-            val network = connectivityManager.activeNetwork
-            if (network != null) {
-                val capabilities = connectivityManager.getNetworkCapabilities(network)
-                _isInternetAvailable.value = capabilities != null && (
-                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
-                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
-                )
-            } else {
-                _isInternetAvailable.value = false
-            }
-        } catch (e: Exception) {
-            _isInternetAvailable.value = false
-        }
-    }
-
-    /**
-     * Refreshes dashboard depending on search query and chosen tab.
-     * Cancels any previously running refreshes/searches to prevent concurrency races/ANRs
-     * on quick keystroke inputs.
-     */
-    fun refreshCurrentResults() {
-        refreshJob?.cancel()
-        refreshJob = viewModelScope.launch {
-            val query = _searchQuery.value
-            val tab = _currentTab.value
-
-            _uiState.value = UiState.Loading
-            try {
-                // Completely offload disk, filtering and scoring calculation tasks to IO/Default background workers
-                val results = withContext(Dispatchers.IO) {
-                    if (tab == "favorites") {
-                        val favoritesList = repository.favorites.first()
-                        favoritesList.map { SearchResult(it, 1.0) }
-                    } else if (query.isBlank()) {
-                        val list = repository.allContent.first()
-                        val filtered = if (tab == "all") list else list.filter { it.type == tab }
-                        filtered.map { SearchResult(it, 1.0) }
-                    } else {
-                        repository.performLocalSearch(query, if (tab == "all") null else tab)
-                    }
-                }
-                _uiState.value = UiState.Success(results)
-            } catch (e: Exception) {
-                if (e !is CancellationException) {
-                    _uiState.value = UiState.Error(e.message ?: "حدث خطأ غير متوقع")
-                }
-            }
-        }
-    }
-
-    /**
-     * Triggers Search (Offline NLP-ranking or Online hybrid synthesis)
-     */
-    fun onSearchProgress(query: String) {
-        _searchQuery.value = query
-        refreshCurrentResults()
-    }
-
-    /**
-     * Complete submission search query - performs AI request if Online-hybrid mode is enabled
-     */
-    fun executeSearch() {
-        val query = _searchQuery.value.trim()
-        if (query.isBlank()) {
-            refreshCurrentResults()
-            return
         }
 
-        refreshJob?.cancel()
-        refreshJob = viewModelScope.launch {
-            recordInterestTopic(query) // الذكاء المعرفي: تسجيل اهتمام المستخدم بالمحور الشرعي تلقائياً
-            checkNetworkConnection()
+        // Prepare directories, check seeding, list initial files
+        viewModelScope.launch {
+            repository.checkAndSeedDatabase()
+            refreshStoredFiles()
             
-            // Check if Offline and Offline Smart Model is downloaded
-            if (!_isInternetAvailable.value && _isOfflineModelDownloaded.value) {
-                _uiState.value = UiState.Loading
-                // Simulate local offline AI processing with beautiful delay
-                kotlinx.coroutines.delay(1000)
-                
-                val aiAnswer = generateLocalIntelligenceAnswer(query)
-                
-                // طبقة التدقيق الشرعي الصارمة: منع الفتاوى العشوائية أو التخمين إذا لم توجد مصادر سياقية دقيقة للمسألة
-                if (_strictShariahValidation.value && (aiAnswer.source.isEmpty() || aiAnswer.text.contains("توجيه شرعي محلي مخصص"))) {
-                    _uiState.value = UiState.Success(listOf(
-                        SearchResult(
-                            IslamicContentEntity(
-                                id = 9991,
-                                type = "fatwa",
-                                title = "التحقق الشرعي: نقص بالأدلة في السؤال",
-                                text = "تنبيه الفحص القيمي الشرعي:\n\nلا يوجد مصدر موثوق كافٍ في قاعدة البيانات المحلية لهذا السؤال لمنحه حكماً قطعياً وموثوقاً بالكامل. يرجى تفعيل الاتصال بالإنترنت لإطلاق البحث الدلالي المعزز بالذكاء الهجين، أو مراجعة اللجان الشرعية والابتعاد وبشدة عن الشُّبهات والتخمين غير العلمي.",
-                                source = "مصفاة التدقيق الشرعي الصارمة بالمنارة",
-                                keywords = "فحص, تدقيق قيمي, دليل ناقص, أمن الفتوى",
-                                normalizedTitle = "",
-                                normalizedText = ""
-                            ),
-                            10.0
-                        )
-                    ))
-                    return@launch
+            // Re-build Vector Index whenever the database records update dynamically
+            launch(Dispatchers.Default) {
+                repository.allContent.collect { list ->
+                    Log.d("MainViewModel", "Re-indexing Local Vector Database with ${list.size} documents...")
+                    com.example.data.vector.LocalVectorDatabase.buildIndex(list)
+                    performSearch() // re-evaluate search with the updated Vector DB values
                 }
+            }
+        }
+    }
 
-                val newEntity = IslamicContentEntity(
-                    type = aiAnswer.type,
-                    title = aiAnswer.title,
-                    text = aiAnswer.text + "\n\n(⚡️ تم توليد هذه الإجابة وتدقيقها محلياً بالكامل عبر نموذج المنارة الذكي أوفلاين)",
-                    source = aiAnswer.source,
-                    keywords = aiAnswer.keywords,
-                    normalizedTitle = ArabicNlpHelper.normalize(aiAnswer.title),
-                    normalizedText = ArabicNlpHelper.normalize(aiAnswer.text)
-                )
+    /**
+     * Re-scans physical app storage subdirectories and updates the file tracker
+     */
+    fun refreshStoredFiles() {
+        val filesMap = mutableMapOf<String, List<File>>()
+        for (cat in DocumentParser.CATEGORIES) {
+            filesMap[cat] = DocumentParser.getFilesByCategory(context, cat)
+        }
+        _storedFiles.value = filesMap
+    }
 
-                val freshMatches = withContext(Dispatchers.IO) {
-                    val insertedId = repository.insert(newEntity)
-                    val cachedEntity = newEntity.copy(id = insertedId.toInt())
-                    val tab = _currentTab.value
-                    val dbMatches = repository.performLocalSearch(query, if (tab == "all") null else tab)
-                    val filteredDb = dbMatches.filter { it.entity.title != cachedEntity.title && it.entity.id != cachedEntity.id }
-                    
-                    val list = mutableListOf<SearchResult>()
-                    list.add(SearchResult(cachedEntity, 3.0)) // score 3.0 represents local offline intelligent generator
-                    list.addAll(filteredDb)
-                    list
+    /**
+     * Perform local normalized NLP search based on current query and category
+     */
+    fun performSearch() {
+        viewModelScope.launch {
+            val query = searchQuery.value.trim()
+            val cat = selectedCategory.value
+
+            if (query.isEmpty()) {
+                // If empty search, fetch everything or category members as fallback
+                val targetFlow = if (cat == "all") {
+                    repository.allContent
+                } else {
+                    repository.getContentByCategory(cat)
                 }
-                _uiState.value = UiState.Success(freshMatches)
+                val rawList = targetFlow.first()
+                _searchResults.value = rawList.map { ScoredResult(it, 1.0) }.take(50)
                 return@launch
             }
 
-            // If Hybrid search and internet is available, let's call Gemini to enrich results
-            if (_searchMode.value == SearchMode.HYBRID && _isInternetAvailable.value) {
-                _uiState.value = UiState.Loading
-                
-                // Call Gemini API on Background Dispatcher (with custom user key if configured and proper AI Mode)
-                val aiAnswer = withContext(Dispatchers.IO) {
-                    GeminiApiClient.generateIslamicResponse(query, _userApiKey.value, _aiMode.value.name)
-                }
-
-                if (aiAnswer.error != null) {
-                    // Graceful fallback: show a warning or fallback to local search
-                    val localMatches = withContext(Dispatchers.IO) {
-                        repository.performLocalSearch(query, if (_currentTab.value == "all") null else _currentTab.value)
-                    }
-                    if (localMatches.isNotEmpty()) {
-                        _uiState.value = UiState.Success(localMatches)
-                    } else {
-                        // DB empty too! Generate a highly polished local Shariah fallback response
-                        val fallbackAi = generateLocalIntelligenceAnswer(query)
-                        if (_strictShariahValidation.value && (fallbackAi.source.isEmpty() || fallbackAi.text.contains("توجيه شرعي محلي مخصص"))) {
-                            _uiState.value = UiState.Success(listOf(
-                                SearchResult(
-                                    IslamicContentEntity(
-                                        id = 9992,
-                                        type = "fatwa",
-                                        title = "التحقق الشرعي: فحص المصادر",
-                                        text = "لا يوجد مصدر موثوق كافٍ في قاعدة البيانات والذاكرة المحلية لهذا السؤال بخصوص $query. يُمنع التخمين والإفتاء بغير دليل مباشر.",
-                                        source = "نظام التدقيق الشرعي بالمنارة",
-                                        keywords = "تدقيق, ناقص, غياب دليل",
-                                        normalizedTitle = "",
-                                        normalizedText = ""
-                                    ),
-                                    10.0
-                                )
-                            ))
-                            return@launch
-                        }
-
-                        val newEntity = IslamicContentEntity(
-                            type = fallbackAi.type,
-                            title = fallbackAi.title,
-                            text = fallbackAi.text + "\n\n(⚡️ لم نتمكن من الاتصال بالخادم الشقيق، تم استخدام محرك الإفتاء المحلي بالمنارة أوفلاين)",
-                            source = fallbackAi.source,
-                            keywords = fallbackAi.keywords,
-                            normalizedTitle = ArabicNlpHelper.normalize(fallbackAi.title),
-                            normalizedText = ArabicNlpHelper.normalize(fallbackAi.text)
-                        )
-                        val freshResults = withContext(Dispatchers.IO) {
-                            val insertedId = repository.insert(newEntity)
-                            val cachedEntity = newEntity.copy(id = insertedId.toInt())
-                            listOf(SearchResult(cachedEntity, 3.0))
-                        }
-                        _uiState.value = UiState.Success(freshResults)
-                    }
-                } else {
-                    // Shariah Strict compliance check on Online generated content
-                    if (_strictShariahValidation.value && (aiAnswer.source.isBlank() || aiAnswer.text.contains("لا يوجد مصدر") || aiAnswer.text.contains("تنبيه الفحص"))) {
-                        _uiState.value = UiState.Success(listOf(
-                            SearchResult(
-                                IslamicContentEntity(
-                                    id = 9993,
-                                    type = "fatwa",
-                                    title = "لا يتوفر دليل كامل",
-                                    text = "حسب مصفاة التدقيق والتحقق الشرعي بالمنارة:\n\nلا يوجد مصدر موثوق كافٍ في قاعدة البيانات لهذا السؤال من مصادر فقهية معتمدة. يمنع الإدلاء بالفتاوى العشوائية أو استقاء الأحكام غيباً بغير وحي أو نص شرعي متفق عليه.",
-                                    source = "مصفاة التحقق الشرعي الصارمة",
-                                    keywords = "فحص, وثوق, تدقيق",
-                                    normalizedTitle = "",
-                                    normalizedText = ""
-                                ),
-                                10.0
-                            )
-                        ))
-                        return@launch
-                    }
-
-                    // Save response locally as a cache to build up the database
-                    val newEntity = IslamicContentEntity(
-                        type = aiAnswer.type,
-                        title = aiAnswer.title,
-                        text = aiAnswer.text,
-                        source = aiAnswer.source,
-                        keywords = aiAnswer.keywords,
-                        normalizedTitle = ArabicNlpHelper.normalize(aiAnswer.title),
-                        normalizedText = ArabicNlpHelper.normalize(aiAnswer.text)
-                    )
-
-                    val mergedResults = withContext(Dispatchers.IO) {
-                        val insertedId = repository.insert(newEntity)
-                        val cachedEntity = newEntity.copy(id = insertedId.toInt())
-                        
-                        // Retrieve traditional matching local references from database
-                        val tab = _currentTab.value
-                        val dbMatches = repository.performLocalSearch(query, if (tab == "all") null else tab)
-                        
-                        // Filter out the exact same newEntity from dbMatches to prevent visual duplication
-                        val filteredDb = dbMatches.filter { it.entity.title != cachedEntity.title && it.entity.id != cachedEntity.id }
-                        
-                        val list = mutableListOf<SearchResult>()
-                        list.add(SearchResult(cachedEntity, 2.0)) // Relevancy score 2.0 marks direct online hybrid response
-                        list.addAll(filteredDb)
-                        list
-                    }
-                    _uiState.value = UiState.Success(mergedResults)
+            val scoredList = if (useVectorSearch.value) {
+                withContext(Dispatchers.Default) {
+                    com.example.data.vector.LocalVectorDatabase.search(query, cat)
+                        .filter { it.score >= relevanceThreshold.value }
                 }
             } else {
-                // Offline Local Search offloaded to background thread
-                _uiState.value = UiState.Loading
-                try {
-                    val results = withContext(Dispatchers.IO) {
-                        repository.performLocalSearch(query, if (_currentTab.value == "all") null else _currentTab.value)
-                    }
-                    if (results.isEmpty()) {
-                        // Generate smart rule-based answer if no matches exist, so we NEVER leave user empty-handed!
-                        val aiAnswer = generateLocalIntelligenceAnswer(query)
-                        
-                        if (_strictShariahValidation.value && (aiAnswer.source.isEmpty() || aiAnswer.text.contains("توجيه شرعي محلي مخصص"))) {
-                            _uiState.value = UiState.Success(listOf(
-                                SearchResult(
-                                    IslamicContentEntity(
-                                        id = 9994,
-                                        type = "fatwa",
-                                        title = "التحقق الشرعي بالمنارة أوفلاين",
-                                        text = "لا يوجد مصدر موثوق كافٍ في قاعدة البيانات للرد القاطع على هذا السؤال الفقهي المعين.",
-                                        source = "مصفاة تصفية الفتاوى غير المسندة",
-                                        keywords = "أمن الفتوى, معلّم",
-                                        normalizedTitle = "",
-                                        normalizedText = ""
-                                    ),
-                                    10.0
-                                )
-                            ))
-                            return@launch
-                        }
-
-                        val newEntity = IslamicContentEntity(
-                            type = aiAnswer.type,
-                            title = aiAnswer.title,
-                            text = aiAnswer.text + "\n\n(⚡️ تم توليد هذه الإجابة وتدقيقها محلياً بالكامل عبر نموذج المنارة الذكي أوفلاين)",
-                            source = aiAnswer.source,
-                            keywords = aiAnswer.keywords,
-                            normalizedTitle = ArabicNlpHelper.normalize(aiAnswer.title),
-                            normalizedText = ArabicNlpHelper.normalize(aiAnswer.text)
-                        )
-                        val freshResults = withContext(Dispatchers.IO) {
-                            val insertedId = repository.insert(newEntity)
-                            val cachedEntity = newEntity.copy(id = insertedId.toInt())
-                            listOf(SearchResult(cachedEntity, 3.0))
-                        }
-                        _uiState.value = UiState.Success(freshResults)
-                    } else {
-                        _uiState.value = UiState.Success(results)
-                    }
-                } catch (e: Exception) {
-                    if (e !is CancellationException) {
-                        _uiState.value = UiState.Error(e.message ?: "حدث خطأ غير متوقع")
-                    }
-                }
-            }
-        }
-    }
-
-    private fun generateLocalIntelligenceAnswer(query: String): com.example.api.IslamicAnswer {
-        val clean = query.lowercase().trim()
-        
-        // Vulgar / Profane / Non-Islamic Check filtering
-        val vulgarKeywords = listOf("عيب", "كلب", "حمار", "وسخ", "سكس", "غبي", "غدر", "لعنة", "يلعن", "برونو", "شتيمة", "احا", "منيك", "شرموط", "مكالمة", "جنس", "يا غبي", "غبي جدا")
-        val isVulgar = vulgarKeywords.any { clean.contains(it) }
-        
-        // Check for creator/designer attribution queries
-        val isAboutCreator = clean.contains("عمرو") || clean.contains("الراضي") || clean.contains("سلامة") || clean.contains("سلامه") ||
-                clean.contains("صنع") || clean.contains("صمم") || clean.contains("برمجة") || clean.contains("برمج") || clean.contains("مطور") ||
-                clean.contains("من انت") || clean.contains("من أنت") || clean.contains("صانع") || clean.contains("عملك") || clean.contains("سواك")
-        
-        return when {
-            isVulgar -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "تنبيه منظومة الأمان والذوق الشرعي",
-                    text = "عذراً يا أخي الفاضل، يمنع هذا التطبيق كلياً الرد على الألفاظ البذيئة أو العبارات الخارجة عن حدود الدين والأخلاق الإسلامية. المبرمج المهندس عمرو سلامة الراضي خصصني لتعليم الفتاوى ونشر التوعية الإسلامية النقية والأدعية الطيبة فقط.",
-                    source = "المنارة للذكاء الإسلامي - بوابة الأمان القيمي",
-                    keywords = "الأمان، فلترة اللفظ، الأخلاق، عمرو سلامة الراضي"
-                )
-            }
-            isAboutCreator -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "مطور ومبرمج تطبيق المنارة",
-                    text = "المطور والمصمم والمسؤول الوحيد عن برمجة تطبيق \"المنارة للذكاء الإسلامي\" هو المهندس عمرو سلامة الراضي.\n\nلقد صمم هذا التطبيق ليكون مساعداً فقهياً ذكياً وموثوقاً مبنياً على التفاسير المعتمدة والأحاديث الصحيحة من أمهات الكتب الإسلامية. وقد حرص على دمج نظام ذكاء اصطناعي محلي متكامل (أوفلاين) قادر على الإجابة الفورية والذكية حتى عند انقطاع الإنترنت، لتوفير خدمة دينية رصينة وعالية الدقة في أي وقت وبكل سهولة ووضوح وبدون أخطاء.",
-                    source = "المنارة للذكاء الإسلامي - الصفحة التعريفية والتوجيه الشرعي",
-                    keywords = "عمرو سلامة الراضي, المبرمج, المطور, المهندس عمرو, صناعة التطبيق"
-                )
-            }
-            clean.contains("nie") || clean.contains("نية") || clean.contains("عمل") || clean.contains("الإخلاص") || clean.contains("اخلاص") -> {
-                com.example.api.IslamicAnswer(
-                    type = "hadith",
-                    title = "أهمية النية وإخلاص العمل لله تعالى",
-                    text = "عن أمير المؤمنين أبي حفص عمر بن الخطاب رضي الله عنه قال: سمعت رسول الله ﷺ يقول: «إنما الأعمال بالنيات، وإنما لكل امرئ ما نوى، فمن كانت هجرته إلى الله ورسوله فهجرته إلى الله ورسوله، ومن كانت هجرته لدنيا يصيبها أو امرأة ينكحها فهجرته إلى ما هاجر إليه».\n\nوالنية هي شرط أساسي لقبول العمل الصالح وبها يفرق العبد بين العبادة والعادة اليومية.",
-                    source = "صحيح البخاري ومسلم - باب الإخلاص والنية لله",
-                    keywords = "النية، الأعمال بالنيات، الإخلاص، النيات، قبول العمل"
-                )
-            }
-            clean.contains("صلاه") || clean.contains("صلاة") || clean.contains("صلي") || clean.contains("صلى") || clean.contains("الصلوات") -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "أركان وشروط الصلاة المفروضة بالكامل",
-                    text = "الصلاة هي عماد الدين وثاني أركان الإسلام.\n\nشروط الصلاة تسعة: الإسلام، والعقل، والتمييز، ورفع الحدث، وإزالة النجاسة، وستر العورة، ودخول الوقت، واستقبل القبلة، والنية.\n\nأركان الصلاة هي: القيام مع القدرة، تكبيرة الإحرام، قراءة الفاتحة، الركوع، الرفع منه، السجود على الأعضاء السبعة، الاعتدال، الجلوس بين السجدتين، الطمأنينة في جميع الأركان، التشهد الأخير والجلوس له، الصلاة على النبي ﷺ، الترتيب والتسليم.\n\nولا تسقط الصلاة بحال عن المكلف طالما كان عقل الإنسان ثابتاً.",
-                    source = "اللجنة الدائمة للبحوث العلمية والإفتاء - الفتوى رقم 821",
-                    keywords = "الصلاة، أركان الصلاة، شروط الصلاة، الصلاة المفروضة"
-                )
-            }
-            clean.contains("وضوء") || clean.contains("الوضوء") || clean.contains("طهار") || clean.contains("طهارة") || clean.contains("غسل") -> {
-                com.example.api.IslamicAnswer(
-                    type = "quran",
-                    title = "صفة الوضوء الشرعي ومبطلاته ونواقضه",
-                    text = "قال الله تعالى: {يَا أَيُّهَا الَّذِينَ آمَنُوا إِذَا قُمْتُمْ إِلَى الصَّلَاةِ فَاغْسِلُوا وُجُوهَكُمْ وَأَيْدِيَكُمْ إِلَى الْمَرَافِقِ وَامْسَحُوا بِرُؤُوسِكُمْ وَأَرْجُلَكُمْ إِلَى الْكَعْبَيْنِ}.\n\nفروض الوضوء ستة:\n1. غسل الوجه (ومنه المضمضة والاستنشاق).\n2. غسل اليدين مع المرفقين.\n3. مسح الرأس كله (ومنه الأذنان).\n4. غسل الرجلين مع الكعبين.\n5. الترتيب.\n6. الموالاة.\n\nأما نواقض الوضوء فمنها: الخارج من السبيلين (من بول أو غائط أو ريح)، زوال العقل بنوم عميق أو نحوه، مس الفرج مباشرة بلا حائل، وأكل لحم الإبل.",
-                    source = "تفسير ابن كثير - سورة المائدة آية 6",
-                    keywords = "الوضوء، صفة الوضوء، الطهارة، فروض الوضوء، نواقض الوضوء"
-                )
-            }
-            clean.contains("صدق") || clean.contains("صدقة") || clean.contains("الصدقة") || clean.contains("زكاة") || clean.contains("الزكاة") || clean.contains("زكاه") || clean.contains("الزكاه") || clean.contains("مال") -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "الفرق بين الزكاة المفروضة والصدقة المستحبة",
-                    text = "الزكاة ركن من أركان الإسلام الخمسة، وهي فرض عين على كل مسلم ملك النصاب (ما يعادل 85 جراماً من الذهب) وحال عليه الحول (عام هجري كامل)، ومقدارها 2.5% من مجموع المال المدخر أو عروض التجارة.\n\nأما الصدقة فهي مستحبة ومندوب إليها في كل وقت، وتطفئ الخطيئة كما يطفئ الماء النار، وتدفع بلاء السوء عن العبد.\n\nقال رسول الله ﷺ: «الصدقة تطفئ الخطيئة كما يطفئ الماء النار».\n\nويجوز تقديم الصدقة للأقارب المحتاجين فلها أجران: أجر الصدقة وأجر صلة الرحم.",
-                    source = "موقع اللجنة الدائمة للبحوث العلمية والإفتاء - فتاوى الزكاة والصدقات",
-                    keywords = "الصدقة، الزكاة، المال, فضل الصدقة، النصاب"
-                )
-            }
-            clean.contains("والد") || clean.contains("والدين") || clean.contains("بر") || clean.contains("ام") || clean.contains("أب") || clean.contains("امي") || clean.contains("أبي") -> {
-                com.example.api.IslamicAnswer(
-                    type = "quran",
-                    title = "وجوب بر الوالدين والإحسان إليهما في الشريعة الإسلامية",
-                    text = "قرن الله تعالى حقه بالإحسان إلى الوالدين لعظم شأنهما.\n\nقال الله تعالى: {وَقَضَى رَبُّكَ أَلَّا تَعْبُدُوا إِلَّا إِيَّاهُ وَبِالْوَالِدَيْنِ إِحْسَانًا إِمَّا يَبْلُغَنَّ عِنْدَكَ الْكِبَرَ أَحَدُهُمَا أَوْ كِلَاهُمَا فَلَا تَعْبُدْ لَهُمَا أُفٍّ وَلَا تَنْهَرْهُمَا وَقُلْ لَهُمَا قَوْلًا كَرِيمًا}.\n\nوبر الوالدين هو من أعظم الأعمال المقربة إلى الله، وهو مقدم حتى على الجهاد الكفائي في سبيل الله. وطاعتهما واجبة في غير معصية الخالق، والدعاء والترحم عليهما بعد وفاتهما هو من أعظم صور البر والوفاء المتواصل.",
-                    source = "تفسير السعدي - سورة الإسراء آية 23",
-                    keywords = "بر الوالدين، الإحسان للأم والأب، عقوق الوالدين، الوالدين"
-                )
-            }
-            clean.contains("صوم") || clean.contains("صيام") || clean.contains("رمضان") || clean.contains("الصوم") || clean.contains("الصيام") -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "أحكام الصيام المفروض ومبطلاته الأساسية",
-                    text = "صيام شهر رمضان المبارك ركن من أركان الإسلام الخمسة، وهو واجب على كل مسلم بالغ، عاقل، مقيم، مستطيع.\n\nمفطرات الصيام الأساسية تشمل:\n1. الأكل والشرب عمداً.\n2. الجماع في نهار رمضان.\n3. القيء المتعمد.\n4. الحجامة.\n5. خروج دم الحيض والنفاس.\n\nمن سنن الصيام تعجيل الفطر وتأخير السحور وكف اللسان عن الكذب والغيبة والنميمة لقول رسول الله ﷺ: «من لم يدع قول الزور والعمل به، فليس لله حاجة في أن يدع طعامه وشرابه».",
-                    source = "اللجنة الدائمة للبحوث العلمية والإفتاء - فتاوى الصيام",
-                    keywords = "الصوم، الصيام، رمضان، مبطلات الصيام، فضل السحور"
-                )
-            }
-            clean.contains("قرآن") || clean.contains("قران") || clean.contains("مصحف") || clean.contains("المصحف") -> {
-                com.example.api.IslamicAnswer(
-                    type = "quran",
-                    title = "فضل تلاوة القرآن الكريم وآداب التعامل مع المصحف الشريف",
-                    text = "القرآن الكريم هو كلام الله تعالى المنزل على نبيه محمد ﷺ، المتعبد بتلاوته.\n\nمن أهم آداب قراءة وتلاوة القرآن:\n1. الإخلاص لله في القراءة.\n2. الطهارة؛ فلا يمس المصحف الورقي إلا طاهر لقوله تعالى {لَّا يَمَسُّهُ إِلَّا الْمُطَهَّرُونَ}.\n3. الاستعاذة بالله من الشيطان الرجيم والبسملة في أوائل السور.\n4. التدبر والخشوع والإنصات لقوله تعالى {وَإِذَا قُرِئَ الْقُرْآنُ فَاسْتَمِعُوا لَهُ وَأَنصِتُوا لَعَلَّكُمْ تُرْحَمُونَ}.\n\nقال رسول الله ﷺ: «من قرأ حرفًا من كتاب الله فله به حسنة، والحسنة بعشر أمثالها». ويجوز القراءة من الهاتف الجوال بغير طهارة صغرى لتسهيل الحفظ والتلاوة.",
-                    source = "كتاب التبيان في آداب حملة القرآن للنووي",
-                    keywords = "القرآن الكريم، كتاب الله، التلاوة، آداب القراءة، المصحف"
-                )
-            }
-            clean.contains("حديث") || clean.contains("الحديث") || clean.contains("سنة") || clean.contains("السنة") || clean.contains("بخاري") || clean.contains("مسلم") -> {
-                com.example.api.IslamicAnswer(
-                    type = "hadith",
-                    title = "حجية السنة النبوية الشريفة وأصح كتب الحديث الحديثية",
-                    text = "السنة النبوية هي المصدر الثاني للتشريع الإسلامي بعد القرآن الكريم، وهي الموضحة والمبينة والمطبقة لأحكام القرآن العظيم بصورة عملية وأخلاقية.\n\nأجمعت الأمة على وجوب العمل بالأحاديث الصحيحة المرفوعة للنبي ﷺ.\n\nويعتبر صحيح البخاري وصحيح مسلم أصح الكتب المصنفة بعد كتاب الله تعالى لقسوة شروط رواتهما وتشددهما البالغ في نقل الأخبار بدقة وأمانة علمية تامة.",
-                    source = "موقع الدرر السنية - الموسوعة الحديثية ومصطلح الحديث",
-                    keywords = "الحديث الشريف، السنة النبوية، صحيح البخاري، صحيح مسلم"
-                )
-            }
-            clean.contains("حج") || clean.contains("الحج") || clean.contains("عمرة") || clean.contains("العمرة") -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "أركان الحج والعمرة والواجبات الشرعية لهما",
-                    text = "الحج ركن من أركان الإسلام وهو فرض عين مرة واحدة في العمر على المستطيع مالياً وبدنياً.\n\nأركان الحج أربعة:\n1. الإحرام (النية).\n2. الوقوف بعرفة وهو ركن الحج الأعظم لقوله ﷺ «الحج عرفة».\n3. طواف الإفاضة.\n4. السعي بين الصفا والمروة.\n\nأما أركان العمرة فثلاثة: الإحرام، والطواف، والسعي. والواجب فيها الحلق أو التقصير للتحلل الكامل.",
-                    source = "سماحة الشيخ ابن باز - فتاوى الحج والنسك والزيارة",
-                    keywords = "الحج، العمرة، أركان الحج, طواف الإفاضة، عرفة"
-                )
-            }
-            clean.contains("ربا") || clean.contains("الربا") || clean.contains("تجارة") || clean.contains("تجاره") || clean.contains("بيع") || clean.contains("البيع") || clean.contains("حلال") || clean.contains("حرام") -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "أحكام التجارة والبيوع وتحريم الربا في المعاملات المالية",
-                    text = "الأصل في المعاملات المالية والتجارة هو الإباحة والحل لقوله تعالى: {وَأَحَلَّ اللَّهُ الْبَيْعَ وَحَرَّمَ الرِّبَا}.\n\nالربا محرم قطعياً بالكتاب والسنة وإجماع الأمة، وهو من السبع الموبقات المهلكات للبركة والمال. ومن شروط صحة البيع والتجارة:\n1. التراضي بين الطرفين لقوله ﷺ «إنما البيع عن تراض».\n2. أن يكون المعقود عليه مباح المنفعة (فلا يجوز بيع المحرمات كالمسرات أو النجاسات).\n3. خلو المعاملة من الغرر والجهالة والربا والاحتكار والتدليس.",
-                    source = "المنارة الشرعية - فقه المعاملات المالية المعاصرة",
-                    keywords = "الربا، البيع، التجارة، المعاملات، حلال وحرام"
-                )
-            }
-            clean.contains("زواج") || clean.contains("الزواج") || clean.contains("طلاق") || clean.contains("الطلاق") || clean.contains("نكاح") -> {
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "مفهوم الزواج وأحكام الطلاق وبناء الأسرة في الإسلام",
-                    text = "الزواج في الإسلام ميثاق غليظ وسنة نبوية جليلة لبناء الأسرة الصالحة على أسس المودة والرحمة لقوله تعالى: {وَمِنْ آيَاتِهِ أَنْ خَلَقَ لَكُم مِّنْ أَنفُسِكُمْ أَزْوَاجًا لِّتَسْكُنُوا إِلَيْهَا وَجَعَلَ بَيْنَكُم مَّوَدَّةً وَرَحْمَةً}.\n\nومن شروط صحة النكاح: رضا الزوجين، تعيينهما، الولي للزوجة، وشاهدا العدل، والمهر (الصداق).\n\nأما الطلاق فهو أبغض الحلال، شرعه الإسلام كعلاج أخير عند استحالة العشرة الزوجية، ويجب أن يقع في طهر لم يجامعها فيه ليكون طلاقاً سنياً لا بدعياً.",
-                    source = "فقه الأسرة الإسلامي - فتاوى النكاح والفرقة الشرعية",
-                    keywords = "الزواج، الطلاق، النكاح، الأسرة، شروط النكاح"
-                )
-            }
-            clean.contains("شرك") || clean.contains("الشرك") || clean.contains("إيمان") || clean.contains("ايمان") || clean.contains("توحيد") || clean.contains("عقيدة") || clean.contains("عقيده") || clean.contains("الله") -> {
-                com.example.api.IslamicAnswer(
-                    type = "quran",
-                    title = "حقيقة التوحيد وأركان الإيمان والتحذير من الشرك بالله",
-                    text = "التوحيد هو أول دعوة الرسل وأساس الدين بأكمله للنجاة من عذاب الله والخلود في الجنة.\n\nأقسام التوحيد ثلاثة:\n1. توحيد الربوبية: إفراد الله تعالى بأفعاله كالخلق والرزق والإحياء والتدبير.\n2. توحيد الألوهية: إفراد الله بعبادة العبد كالصلاة والدعاء والخوف والرجاء النقي.\n3. توحيد الأسماء والصفات: إيجاب ما أثبته الله لنفسه وما أثبته له رسوله من صفات جلال وجمال من غير تكييف ولا تمثيل ولا تعطيل.\n\nأركان الإيمان ستة: الإيمان بالله، وملائكته، وكتبه، ورسله، واليوم الآخر، والقدر خيره وشره.\n\nأما الشرك فهو أعظم الذنوب على الإطلاق وهو محبط لجميع الأعمال وصاحبه لا يغفر له إن مات عليه لقوله تعالى: {إِنَّ اللَّهَ لَا يَغْفِرُ أَن يُشْرَكَ بِهِ وَيَغْفِرُ مَا دُونَ ذَٰلِكَ لِمَن يَشَاءُ}.",
-                    source = "كتاب التوحيد للإمام محمد بن عبد الوهاب - العقيدة الواسطية",
-                    keywords = "التوحيد، العقيدة الإسلامية، الشرك بالله، أركان الإيمان، الإيمان"
-                )
-            }
-            clean.contains("دعاء") || clean.contains("أذكار") || clean.contains("اذكار") || clean.contains("ذكر") || clean.contains("الذكر") || clean.contains("استغفار") || clean.contains("الاستغفار") -> {
-                com.example.api.IslamicAnswer(
-                    type = "adhkar",
-                    title = "فضل الاستغفار والذكر وسيد الاستغفار الشرعي",
-                    text = "الذكر والدعاء هما صلة العبد بربه المعبود، والاستغفار طارد للهموم وجالب للمغفرة والبركة في الرزق والولد بالدنيا لقوله تعالى: {فَقُلْتُ اسْتَغْفِرُوا رَبَّكُمْ إِنَّهُ كَانَ غَفَّارًا * يُرْسِلِ السَّمَاءَ عَلَيْكُم مِّدْرَارًا}.\n\nوأفضل صيغ الاستغفار هو سيد الاستغفار لقوله ﷺ: «اللهم أنت ربي لا إله إلا أنت، خلقتني وأنا عبدك، وأنا على عهدك ووعدك ما استطعت، أعوذ بك من شر ما صنعت، أبوء لك بنعمتك علي، وأبوء بذنبي فاغفر لي فإنه لا يغفر الذنوب إلا أنت».\n\nمن لزم الاستغفار جعل الله له من كل هم فرجاً ومن كل ضيق مخرجاً ورزقه من حيث لا يحتسب.",
-                    source = "صحيح البخاري ومسلم - رياض الصالحين للنووي",
-                    keywords = "سيد الاستغفار، أذكار الصباح والمساء، فضل الذكر، الاستغفار، الدعاء"
-                )
-            }
-            else -> {
-                // Highly intelligent dynamic system fallback that customized its response according to user query to avoid boring static text!
-                val cleanWords = clean.split(" ", "،", "؟", "!", ".").filter { it.length > 2 }
-                val keywordHighlights = if (cleanWords.isNotEmpty()) {
-                    cleanWords.take(3).joinToString(" و ") { "«$it»" }
+                // Perform SQLite query, then run refined Arabic NLP matching
+                val candidates = if (cat == "all") {
+                    repository.searchContent(query)
                 } else {
-                    "استفسارك الكريم"
+                    repository.searchContentByCategory(cat, query)
                 }
-
-                com.example.api.IslamicAnswer(
-                    type = "fatwa",
-                    title = "توجيه شرعي محلي مخصص حول: $query",
-                    text = "الحمد لله والصلاة والسلام على رسول الله وعلى آله وصحبه ومن والاه.\n\nبناءً على تفعيلك للمساعد الفقهي الأوفلاين للبحث في $keywordHighlights، تفيدك المنارة الإسلامية بالتوجيه الفقهي التالي:\n\n١. يسعدنا إفادتك بأن المنارة للإفتاء تتيح لك البحث عن كل ما يخص العبادات والشريعة أوفلاين بسلاسة فائقة.\n٢. أصل العبادات والمعاملات قائم على نية القلب الصادقة، وموافقة السنة الشريفة للنبي ﷺ، والابتعاد وبشدة عن الشبهات والحدث المحدث الذي لم يثبت بالدليل من أمهات الكتب.\n٣. نرجو توجيه دقيق للأسئلة بعبارات شرعية واضحة (مثل أحكام الصلاة، شروط الوضوء، فضل الاستغفار، عقيدة التوحيد)، وسوف يمنحك محرك المنارة المحسن فتاوى دقيقة ومختارة بعناية بالغة من كبار علماء الإسلام واللجان المعتمدة.\n\nنسأل الله العظيم أن يفقهنا وإياكم في الدين ويعلمنا التنزيل.",
-                    source = "المنارة للذكاء الإسلامي - بوابة الإفتاء الشرعي الفوري أوفلاين",
-                    keywords = "البحث الفقهي, فتوى مخصصة, أوفلاين, البحث الشرعي كبار العلماء"
-                )
+                candidates.map { entity ->
+                    val score = ArabicNlpHelper.calculateMatchScore(query, entity.title, entity.content)
+                    ScoredResult(entity, score)
+                }.filter { scored ->
+                    scored.score >= relevanceThreshold.value
+                }.sortedByDescending { it.score }
             }
+
+            _searchResults.value = scoredList
         }
     }
 
     /**
-     * Toggles favorite status of an item
+     * Smart context-guided query using Hybrid RAG + Customized Gemini Persona parameters.
+     * Guarantees highly relevant, context-grounded Islamic responses!
      */
-    fun toggleFavorite(item: IslamicContentEntity) {
+    fun askGemini(question: String) {
+        if (question.trim().isEmpty()) return
+
         viewModelScope.launch {
-            val updated = item.copy(isFavorite = !item.isFavorite)
-            withContext(Dispatchers.IO) {
-                repository.update(updated)
-            }
-            refreshCurrentResults()
-        }
-    }
+            isAiLoading.value = true
+            aiAnswer.value = "جاري تجميع المصادر الدلالية وتحليل النطاق..."
 
-    /**
-     * Deletes custom cached item
-     */
-    fun deleteItem(id: Int) {
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                repository.deleteById(id)
-            }
-            refreshCurrentResults()
-        }
-    }
-
-    // Advanced Islamic AI Core v2 properties
-    private val _safeModeEnabled = MutableStateFlow(prefs.getBoolean("safe_mode_enabled", true))
-    val safeModeEnabled: StateFlow<Boolean> = _safeModeEnabled.asStateFlow()
-
-    fun setSafeModeEnabled(enabled: Boolean) {
-        _safeModeEnabled.value = enabled
-        prefs.edit().putBoolean("safe_mode_enabled", enabled).apply()
-        refreshCurrentResults()
-    }
-
-    private val _autoUpdateEnabled = MutableStateFlow(prefs.getBoolean("auto_update_enabled", true))
-    val autoUpdateEnabled: StateFlow<Boolean> = _autoUpdateEnabled.asStateFlow()
-
-    fun setAutoUpdateEnabled(enabled: Boolean) {
-        _autoUpdateEnabled.value = enabled
-        prefs.edit().putBoolean("auto_update_enabled", enabled).apply()
-        refreshCurrentResults()
-    }
-
-    enum class AiSearchPattern {
-        QUICK,      // إجابة فورية من مصدر واحد موثوق
-        DEEP,       // تحليل عدة مصادر ومقارنة النتائج
-        SCHOLARLY   // بحث فقهي وعلمي بكتب الأئمة المعتمدة
-    }
-
-    private val _aiSearchPattern = MutableStateFlow(AiSearchPattern.valueOf(prefs.getString("ai_search_pattern", AiSearchPattern.DEEP.name) ?: AiSearchPattern.DEEP.name))
-    val aiSearchPattern: StateFlow<AiSearchPattern> = _aiSearchPattern.asStateFlow()
-
-    fun setAiSearchPattern(pattern: AiSearchPattern) {
-        _aiSearchPattern.value = pattern
-        prefs.edit().putString("ai_search_pattern", pattern.name).apply()
-        refreshCurrentResults()
-    }
-
-    // SAF Request System fields
-    private val _pendingImportContent = MutableStateFlow("")
-    val pendingImportContent: StateFlow<String> = _pendingImportContent.asStateFlow()
-
-    private val _pendingImportFormat = MutableStateFlow("json")
-    val pendingImportFormat: StateFlow<String> = _pendingImportFormat.asStateFlow()
-
-    data class ContentSafeAnalysis(
-        val isSafe: Boolean,
-        val classification: String, // "إسلامي ديني مدقق" / "غير متعلق بالشريعة" / "محتوى مشبوه"
-        val reliabilityScore: Int, // 10% - 100%
-        val isVerifiedSource: Boolean,
-        val details: String
-    )
-
-    private val _safeAnalysisResult = MutableStateFlow<ContentSafeAnalysis?>(null)
-    val safeAnalysisResult: StateFlow<ContentSafeAnalysis?> = _safeAnalysisResult.asStateFlow()
-
-    private val _showSafeCheckDialog = MutableStateFlow(false)
-    val showSafeCheckDialog: StateFlow<Boolean> = _showSafeCheckDialog.asStateFlow()
-
-    fun triggerSafeCheck(content: String, format: String) {
-        _pendingImportContent.value = content
-        _pendingImportFormat.value = format
-        _isImporting.value = true
-        _importStatus.value = "جاري إجراء فحص التدقيق القيمي والأمور الشرعية (SAFE Check)..."
-
-        val hasNonReligious = content.contains("تكنولوجيا") || content.contains("كرة القدم") || content.contains("برمجة") ||
-                               content.contains("أفلام") || content.contains("ألعاب") || content.contains("sports")
-        val isSuspect = content.contains("الحاد") || content.contains("مضلل") || content.contains("مسيء") || content.contains("إساءة") || content.contains("شركيات")
-        val containsMuslimBukhari = content.contains("البخاري") || content.contains("مسلم") || content.contains("النووي") || content.contains("القرآن")
-
-        val classification = when {
-            isSuspect -> "محتوى غير موثوق أو فيه إثارة شبهات"
-            hasNonReligious -> "محتوى مختلط / غير متعلق بالدراسات الشرعية"
-            else -> "إسلامي ديني موثق ومدقق"
-        }
-
-        val isSafe = !isSuspect && !hasNonReligious
-        val reliability = when {
-            containsMuslimBukhari -> 100
-            isSafe -> 95
-            hasNonReligious -> 45
-            else -> 15
-        }
-
-        val details = when {
-            isSuspect -> "تنبيه: تم رصد عبارات أو ألفاظ لا تتوافق مع مصفاة الأمان العقدي والشريعة وتعتبر من المصادر المشبوهة."
-            hasNonReligious -> "تنبيه هام ومبسط: هذا الملف يحتوي على مواضيع دنيوية ممتزجة وليست دينية محضة. منصة المنارة تقتصر بالكامل على العلوم والفقه الإسلامي."
-            else -> "تم التحقق والفلترة بنجاح. المحتوى مسند ومتوافق تماماً مع قواعد بيانات العلوم الشرعية الموثوقة."
-        }
-
-        _safeAnalysisResult.value = ContentSafeAnalysis(
-            isSafe = isSafe,
-            classification = classification,
-            reliabilityScore = reliability,
-            isVerifiedSource = containsMuslimBukhari,
-            details = details
-        )
-        _showSafeCheckDialog.value = true
-        _isImporting.value = false
-    }
-
-    fun dismissSafeCheck() {
-        _showSafeCheckDialog.value = false
-        _safeAnalysisResult.value = null
-        _pendingImportContent.value = ""
-    }
-
-    fun confirmSafeImport() {
-        val content = _pendingImportContent.value
-        val format = _pendingImportFormat.value
-        _showSafeCheckDialog.value = false
-        _pendingImportContent.value = ""
-        importDataFile(content, format)
-    }
-
-    fun setCategoryTab(tab: String) {
-        _currentTab.value = tab
-    }
-
-    fun setSearchMode(mode: SearchMode) {
-        _searchMode.value = mode
-        refreshCurrentResults()
-    }
-
-    /**
-     * Parse and import JSON, CSV or TXT formatted text files directly to local Room Database.
-     * Operates securely on a background dispatcher with state-progress reporting.
-     */
-    fun importDataFile(contentString: String, fileType: String): Boolean {
-        if (contentString.isBlank()) return false
-        _isImporting.value = true
-        _importStatus.value = "جاري الفحص البرمجي التلقائي للملف..."
-        
-        try {
-            val entitiesToInsert = mutableListOf<IslamicContentEntity>()
-            when (fileType.lowercase().trim()) {
-                "json" -> {
-                    // Supported fields: type, title, text, source, keywords
-                    // Fallback to split based on standard keys block
-                    val blocks = contentString.split("},{", "}, {")
-                    for (block in blocks) {
-                        val title = block.substringAfter("\"title\"").substringAfter("\"").substringBefore("\"")
-                        val text = block.substringAfter("\"text\"").substringAfter("\"").substringBefore("\"").replace("\\n", "\n")
-                        val type = block.substringAfter("\"type\"").substringAfter("\"").substringBefore("\"")
-                        val source = block.substringAfter("\"source\"").substringAfter("\"").substringBefore("\"")
-                        val keywords = block.substringAfter("\"keywords\"").substringAfter("\"").substringBefore("\"")
-                        if (title.isNotBlank() && text.isNotBlank()) {
-                            val cleanType = if (type.contains("quran") || type.contains("hadith") || type.contains("fatwa") || type.contains("adhkar")) type else "fatwa"
-                            entitiesToInsert.add(
-                                IslamicContentEntity(
-                                    type = cleanType,
-                                    title = title,
-                                    text = text,
-                                    source = if (source.isBlank() || source == block) "مستند مستورد" else source,
-                                    keywords = if (keywords.isBlank() || keywords == block) "" else keywords,
-                                    normalizedTitle = ArabicNlpHelper.normalize(title),
-                                    normalizedText = ArabicNlpHelper.normalize(text)
-                                )
-                            )
-                        }
-                    }
+            // 1. Fetch relevant local passages for the RAG prompt
+            val scoredPassages = if (useVectorSearch.value) {
+                withContext(Dispatchers.Default) {
+                    com.example.data.vector.LocalVectorDatabase.search(question, selectedCategory.value)
+                        .filter { it.score >= relevanceThreshold.value }
                 }
-                "csv" -> {
-                    val lines = contentString.split("\n")
-                    for (line in lines) {
-                        if (line.isBlank() || !line.contains(",")) continue
-                        val parts = line.split(",")
-                        if (parts.size >= 3) {
-                            val type = parts[0].trim().replace("\"", "")
-                            val title = parts[1].trim().replace("\"", "")
-                            val text = parts[2].trim().replace("\"", "").replace("\\n", "\n")
-                            val source = if (parts.size > 3) parts[3].trim().replace("\"", "") else "مستند مستورد"
-                            val keywords = if (parts.size > 4) parts[4].trim().replace("\"", "") else ""
-                            
-                            val cleanType = if (type.contains("quran") || type.contains("hadith") || type.contains("fatwa") || type.contains("adhkar")) type else "fatwa"
-                            entitiesToInsert.add(
-                                IslamicContentEntity(
-                                    type = cleanType,
-                                    title = title,
-                                    text = text,
-                                    source = source,
-                                    keywords = keywords,
-                                    normalizedTitle = ArabicNlpHelper.normalize(title),
-                                    normalizedText = ArabicNlpHelper.normalize(text)
-                                )
-                            )
-                        }
-                    }
+            } else {
+                val queryCandidatesByNlp = if (selectedCategory.value == "all") {
+                    repository.searchContent(question)
+                } else {
+                    repository.searchContentByCategory(selectedCategory.value, question)
                 }
-                "txt" -> {
-                    val entries = contentString.split("---")
-                    for (entry in entries) {
-                        if (entry.isBlank()) continue
-                        var title = ""
-                        var text = ""
-                        var type = "fatwa"
-                        var source = "ملف نصي مستورد"
-                        var keywords = ""
-                        
-                        val lines = entry.split("\n")
-                        for (line in lines) {
-                            val trimmed = line.trim()
-                            if (trimmed.startsWith("العنوان:")) {
-                                title = trimmed.substringAfter("العنوان:").trim()
-                            } else if (trimmed.startsWith("النص:")) {
-                                text = trimmed.substringAfter("النص:").trim()
-                            } else if (trimmed.startsWith("النوع:")) {
-                                type = trimmed.substringAfter("النوع:").trim()
-                            } else if (trimmed.startsWith("المصدر:")) {
-                                source = trimmed.substringAfter("المصدر:").trim()
-                            } else if (trimmed.startsWith("الكلمات:")) {
-                                keywords = trimmed.substringAfter("الكلمات:").trim()
-                            }
-                        }
-                        if (title.isNotBlank() && text.isNotBlank()) {
-                            val cleanType = if (type.contains("quran") || type.contains("hadith") || type.contains("fatwa") || type.contains("adhkar")) type else "fatwa"
-                            entitiesToInsert.add(
-                                IslamicContentEntity(
-                                    type = cleanType,
-                                    title = title,
-                                    text = text,
-                                    source = source,
-                                    keywords = keywords,
-                                    normalizedTitle = ArabicNlpHelper.normalize(title),
-                                    normalizedText = ArabicNlpHelper.normalize(text)
-                                )
-                            )
-                        }
-                    }
-                }
+                queryCandidatesByNlp.map { entity ->
+                    val score = ArabicNlpHelper.calculateMatchScore(question, entity.title, entity.content)
+                    ScoredResult(entity, score)
+                }.filter { scored ->
+                    scored.score >= relevanceThreshold.value
+                }.sortedByDescending { it.score }
             }
             
-            if (entitiesToInsert.isNotEmpty()) {
-                viewModelScope.launch(Dispatchers.IO) {
-                    for (entity in entitiesToInsert) {
-                        repository.insert(entity)
+            // Limit to top 5 scored fragments for compact token limits
+            val topGroundedContext = scoredPassages.take(5).map { it.entity }
+            referencedContexts.value = topGroundedContext
+
+            // 2. Build the detailed context text
+            val contextBuilder = StringBuilder()
+            if (topGroundedContext.isNotEmpty()) {
+                contextBuilder.append("المستندات والمصادر الشرعية الموثوقة المتاحة للرجوع إليها:\n")
+                topGroundedContext.forEachIndexed { idx, item ->
+                    val catArabic = when (item.category) {
+                        "quran" -> "القرآن الكريم"
+                        "hadith" -> "الحديث الشريف"
+                        "fatawa" -> "الفتاوى والأحكام"
+                        else -> "مستند مستخدم"
                     }
-                    withContext(Dispatchers.Main) {
-                        _importStatus.value = "تم بنجاح استيراد عدد ${entitiesToInsert.size} من السجلات الشرعية الجديدة وتحديث الفهرسة الذكية! 🎉"
-                        _isImporting.value = false
-                        refreshCurrentResults()
+                    contextBuilder.append("[مصدر رقم ${idx + 1}] [$catArabic - ${item.title}] (المرجع: ${item.reference}):\n\"${item.content}\"\n\n")
+                }
+            } else {
+                contextBuilder.append("ملاحظة: لا توجد نصوص متطابقة مباشرة في قاعدة البيانات المحلية الموثوقة لهذا السؤال المحدد.\n")
+            }
+
+            // 3. Define the Persona system instruction
+            val personaName = when (shariahPersona.value) {
+                "fiqh" -> "الفقيه أو الباحث الفقهي الدقيق (الالتزام بالأدلة التفصيلية وتوضيح الأحكام والأقوال المعتمدة)"
+                "spiritual" -> "واعظ تربوي يعتني بتزكية النفوس ورقائق القلوب والمقاصد الإيمانية وصلاح العمل"
+                "tafsir" -> "مفسر قرآني يعتني بالبلاغة القرآنية والبيان واللغة وأسباب النزول ودلالة اللفظ"
+                else -> "باحث إسلامي متوازن يستعرض الأدلة بوسطية ويسر مع تجنب الفتاوى الشاذة بالاعتماد على الوحيين"
+            }
+
+            val systemInstruction = """
+                أنت مساعد إرشادي إسلامي ذكي باسم 'مساعد المنارة للذكاء الإسلامي'.
+                مهمتك الإجابة على استفسارات المستخدمين بلغة عربية فصحى راقية، بأسلوب موثوق، علمي، دقيق وخالٍ من الغلو أو التضليل.
+                
+                التموضع أو الأسلوب الشرعي المختار لك هو: ($personaName).
+                
+                $contextBuilder
+                
+                قواعد هامة للإجابة:
+                1. التزم بدقة فائقة بمضمون المصادر والمستندات المحلية متى توفرت. 
+                2. عند الاقتباس أو الإحالة، اذكر بوضوح اسم السورة ورقم الآية، أو رقم الحديث وكتابه، أو المستند المصدر لتسهيل التوثق من المعرفة.
+                3. إذا كان السؤال خارج نطاق المصادر المتاحة، وكنت ستستخدم المعرفة العامة لـ Gemini، نبّه المستخدم بلطف قائلًا: "أجيبك بناءً على المعرفة العامة والقرائن الفقهية المعتمدة..." دون الخروج عن المنهج الوسطي السليم.
+                4. إذا تعارض شيء في المعرفة العامة مع الأدلة الصحيحة المذكورة في المصادر المحلية المرفقة، يجب ترجيح النص المذكور في المصادر المحلية.
+                5. احرص على تخريج الأحاديث وذكر درجاتها إن أمكن لضمان الموثوقية والدقة.
+                
+                ${if (customSystemPrompt.value.isNotEmpty()) "تنبيه إضافي من المستخدم مدمج كتعليمات للنظام:\n${customSystemPrompt.value}" else ""}
+            """.trimIndent()
+
+            // 4. Construct prompt body
+            val finalPromptBuilder = StringBuilder()
+            finalPromptBuilder.append("سؤال المستخدم: $question\n\n")
+            if (useLocalDataOnly.value) {
+                finalPromptBuilder.append("تنبيه: لقد قام المستخدم بتفعيل خيار 'البحث في البيانات المحلية والملفات فقط'. يرجى الحذر الشديد وعدم إدراج أي استنتاجات لا يدعمها سياق المصادر المرفقة المذكور أعلاه. في حال غياب الدليل، قل بوضوح: 'المعلومة غير متوفرة في الملفات المحلية المحفوظة'.")
+            } else {
+                finalPromptBuilder.append("يرجى الإجابة باستفاضة ووضوح ويسر ومطابقة للسياق.")
+            }
+
+            webSources.value = emptyList()
+            webQueries.value = emptyList()
+
+            try {
+                val shouldWebSearch = enableWebSearch.value && !useLocalDataOnly.value
+                val result = GeminiApiClient.generateAnswer(
+                    prompt = finalPromptBuilder.toString(),
+                    systemInstructionText = systemInstruction,
+                    temperature = temperature.value,
+                    enableWebSearch = shouldWebSearch,
+                    customApiKey = customApiKey.value
+                )
+                aiAnswer.value = result.answer
+                webSources.value = result.webSources
+                webQueries.value = result.webQueries
+            } catch (e: Exception) {
+                aiAnswer.value = "حدث خطأ غير متوقع أثناء معالجة السؤال: ${e.localizedMessage}"
+            } finally {
+                isAiLoading.value = false
+            }
+        }
+    }
+
+    // --- File Storage Operations ---
+
+    /**
+     * Import raw text file directly to a category directory and immediately parse/index it.
+     */
+    fun importCustomFile(category: String, filename: String, content: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                try {
+                    val file = DocumentParser.writeTextFile(context, category, filename, content)
+                    DocumentParser.indexFileIntoDb(context, database, file, category)
+                } catch (e: Exception) {
+                    Log.e("ViewModel", "Failed to import custom document", e)
+                }
+            }
+            refreshStoredFiles()
+            performSearch()
+        }
+    }
+
+    /**
+     * Decompress a ZIP file uploaded or passed, unzipping text files, sorting into subdirectories and indexing them all.
+     */
+    fun importAndUnzipFile(zipFile: File) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                try {
+                    val extracted = DocumentParser.unzipAndClassify(context, zipFile)
+                    for (file in extracted) {
+                        val category = when {
+                            file.parent?.endsWith("quran") == true -> "quran"
+                            file.parent?.endsWith("hadith") == true -> "hadith"
+                            file.parent?.endsWith("fatawa") == true -> "fatawa"
+                            else -> "user_docs"
+                        }
+                        DocumentParser.indexFileIntoDb(context, database, file, category)
+                    }
+                } catch (e: Exception) {
+                    Log.e("ViewModel", "Failed to decompress ZIP package", e)
+                }
+            }
+            refreshStoredFiles()
+            performSearch()
+        }
+    }
+
+    /**
+     * Delete a physical file and clear its index entries from the local database
+     */
+    fun deleteStoredFile(file: File, category: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                try {
+                    if (file.exists()) {
+                        file.delete()
+                    }
+                    repository.deleteBySourceFile(file.name)
+                } catch (e: Exception) {
+                    Log.e("ViewModel", "Failed to delete file", e)
+                }
+            }
+            refreshStoredFiles()
+            performSearch()
+        }
+    }
+
+    /**
+     * Parse/Re-index a stored file in the app directory
+     */
+    fun indexFile(file: File, category: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                DocumentParser.indexFileIntoDb(context, database, file, category)
+            }
+            performSearch()
+        }
+    }
+
+    /**
+     * Generate actual example files in standard app data path and index them immediately!
+     * This makes testing the 'Android/data/.../files' decompressing, categorization and indexing features effortless!
+     */
+    fun seedSampleFilesToAndroidData() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                try {
+                    // Quran verse
+                    DocumentParser.writeTextFile(
+                        context, "quran", "القران_الصبر_اليسر.txt",
+                        "مواضع الصبر والتيسير في القرآن الكريم:\n" +
+                                "---\n" +
+                                "موضع 1: إِنَّ مَعَ الْعُسْرِ يُسْرًا\n" +
+                                "فرد رباني يرسخ الأمل بأن الصعاب متبوعة بتفريج إلهي مؤكد ومنة من الله على القلوب المؤمنة.\n" +
+                                "المرجع: سورة الشرح الآية 6\n" +
+                                "---\n" +
+                                "موضع 2: وَبَشِّرِ الصَّابِرِينَ * الَّذِينَ إِذَا أَصَابَتْهُم مُّصِيبَةٌ قَالُوا إِنَّا لِلَّهِ وَإِنَّا إِلَيْهِ رَاجِعُونَ\n" +
+                                "جزاء الصبر الجميل والتسليم لرب السموات وبشارة بصلوات من ربهم ورحمة.\n" +
+                                "المرجع: سورة البقرة الآية 155 - 156"
+                    )
+
+                    // Hadith
+                    DocumentParser.writeTextFile(
+                        context, "hadith", "رياض_الصالحين_الادب.txt",
+                        "أحاديث في حسن الخلق:\n" +
+                                "---\n" +
+                                "حديث البر والآونة:\n" +
+                                "سألت رسول الله صلى الله عليه وسلم عن البر والإثم؟ فقال: البر حسن الخلق، والإثم ما حاك في صدرك وكرهت أن يطلع عليه الناس.\n" +
+                                "المرجع: صحيح مسلم رقم 2553\n" +
+                                "---\n" +
+                                "حديث كمال الإيمان:\n" +
+                                "قال رسول الله صلى الله عليه وسلم: أكمل المؤمنين إيماناً أحسنهم خلقاً، وخياركم خياركم لنسائهم خلقاً.\n" +
+                                "المرجع: سنن الترمذي رقم 1162"
+                    )
+
+                    // Fatawa
+                    DocumentParser.writeTextFile(
+                        context, "fatawa", "احكام_الزكاة_والصدقة.txt",
+                        "نوازل فقهية حول الزكاة:\n" +
+                                "---\n" +
+                                "فتوى زكاة المال المدخر لبناء المسكن:\n" +
+                                "السؤال: هل تجب الزكاة في المال المحفوظ بنية شراء أو بناء منزل للسكن؟\n" +
+                                "الجواب: نعم، تجب الزكاة في هذا المال المدخر إذا بلغ النصاب وحال عليه الحول الهجري، لأن النية المستقبلية لبناء مسكن لا تمنع وجوب الزكاة الحالية في النقد المتوفر.\n" +
+                                "المرجع: فتاوى ابن باز رحمه الله 12/45\n" +
+                                "---\n" +
+                                "فتوى صدقة التطوع في مقابل الزكاة المفروضة:\n" +
+                                "الجواب: لا تجزئ صدقة التطوع لإبراء ذمة الزكاة الواجبة؛ فالزكاة ركن مالي مستقل له مصارفه الثمانية المحددة في سورة التوبة آية 60، بينما الصدقة باب تطوع مفتوح."
+                    )
+
+                    // User documents
+                    DocumentParser.writeTextFile(
+                        context, "user_docs", "مفكرة_تدبرات_شخصية.txt",
+                        "تدبرات يوم الجمعة:\n" +
+                                "---\n" +
+                                "تأملات في سورة الكهف:\n" +
+                                "أهمية الكهف كملجأ للمؤمن، وكيف يحفظ الله دينه ويثبت قلبه في خضم الفتن الصعبة.\n" +
+                                "المرجع: تدبر ذاتي عام 2026\n" +
+                                "---\n" +
+                                "أذكار الصباح والمساء المفضلة:\n" +
+                                "قراءة آية الكرسى والمعوذات ثلاث مرات صباحا ومساء، ورضيت بالله ربا وبالإسلام دينا وبمحمد صلى الله عليه وسلم نبيا."
+                    )
+
+                    // Additionally, let's trigger a dummy ZIP mock creation to test ZIP unzipping.
+                    // We will write a small zip file inside app internal directory
+                    val zipFile = File(context.cacheDir, "test_archive.zip")
+                    FileOutputStream(zipFile).use { fos ->
+                        java.util.zip.ZipOutputStream(fos).use { zos ->
+                            // Entry 1- Hadith text inside zip
+                            zos.putNextEntry(ZipEntry("bukhari_zip_excerpt_hadith.txt"))
+                            val hadithData = "أحاديث من البخاري مجمعة:\n---\n" +
+                                    "حديث طلب العلم:\n" +
+                                    "قال صلى الله عليه وسلم: إن الله لا يقبض العلم انتزاعا ينتزعه من العباد ولكن يقبض العلم بقبض العلماء.\n" +
+                                    "المرجع: البخاري 100"
+                            zos.write(hadithData.toByteArray(Charsets.UTF_8))
+                            zos.closeEntry()
+
+                            // Entry 2- Quran text inside zip
+                            zos.putNextEntry(ZipEntry("quran_zip_excerpt.txt"))
+                            val quranData = "آيات قصيرة:\n---\n" +
+                                    "سورة الملك موضع 1:\n" +
+                                    "الَّذِي خَلَقَ الْمَوْتَ وَالْحَيَاةَ لِيَبْلُوَكُمْ أَيُّكُمْ أَحْسَنُ عَمَلًا وَهُوَ الْعَزِيزُ الْغَفُورُ\n" +
+                                    "المرجع: سورة الملك الآية 2"
+                            zos.write(quranData.toByteArray(Charsets.UTF_8))
+                            zos.closeEntry()
+                        }
+                    }
+
+                    // Run automatic decompression & indexing on the test ZIP!
+                    val extracted = DocumentParser.unzipAndClassify(context, zipFile)
+                    for (file in extracted) {
+                        val category = when {
+                            file.parent?.endsWith("quran") == true || file.name.contains("quran") -> "quran"
+                            file.parent?.endsWith("hadith") == true || file.name.contains("hadith") -> "hadith"
+                            file.parent?.endsWith("fatawa") == true || file.name.contains("fatwa") -> "fatawa"
+                            else -> "user_docs"
+                        }
+                        DocumentParser.indexFileIntoDb(context, database, file, category)
+                    }
+
+                    // Scan the remaining created files
+                    for (cat in DocumentParser.CATEGORIES) {
+                        val files = DocumentParser.getFilesByCategory(context, cat)
+                        for (file in files) {
+                            DocumentParser.indexFileIntoDb(context, database, file, cat)
+                        }
+                    }
+
+                } catch (e: Exception) {
+                    Log.e("Seed", "Failed to seed storage directories", e)
+                }
+            }
+            refreshStoredFiles()
+            performSearch()
+        }
+    }
+
+    // --- Search Recitation Media Player Support ---
+    val availableReciters = listOf(
+        Reciter("alafasy", "مشاري العفاسي", "Mishary Alafasy", "Alafasy_128kbps"),
+        Reciter("husary", "محمود خليل الحصري", "Mahmoud Al-Husary", "Husary_128kbps"),
+        Reciter("abdulbasit", "عبد الباسط عبد الصمد", "عبد الباسط (مجود)", "Abdul_Basit_Mujawwad_128kbps"),
+        Reciter("ghamadi", "سعد الغامدي", "Saad Al-Ghamdi", "Ghamadi_40kbps")
+    )
+
+    val selectedReciter = MutableStateFlow(availableReciters[0])
+    val currentAudioEntity = MutableStateFlow<IslamicContentEntity?>(null)
+    val isAudioPlaying = MutableStateFlow(false)
+    val isAudioBuffering = MutableStateFlow(false)
+    val audioDuration = MutableStateFlow(0)
+    val audioPosition = MutableStateFlow(0)
+    val audioProgress = MutableStateFlow(0f)
+    val currentVerseIndex = MutableStateFlow(0)
+    val totalVersesInEntity = MutableStateFlow(0)
+
+    private var mediaPlayer: MediaPlayer? = null
+    private var activeVerseNumbers = emptyList<Int>()
+    private var activeSurahNumber = 0
+    private var progressJob: kotlinx.coroutines.Job? = null
+
+    val surahMap = mapOf(
+        "الفاتحة" to 1, "البقرة" to 2, "آل عمران" to 3, "النساء" to 4, "المائدة" to 5, "الأنعام" to 6, "الأعراف" to 7, "الأنفال" to 8, "التوبة" to 9, "يونس" to 10,
+        "هود" to 11, "يوسف" to 12, "الرعد" to 13, "إبراهيم" to 14, "الحجر" to 15, "النحل" to 16, "الإسراء" to 17, "الكهف" to 18, "مريم" to 19, "طه" to 20,
+        "الأنبياء" to 21, "الحج" to 22, "المؤمنون" to 23, "النور" to 24, "الفرقان" to 25, "الشعراء" to 26, "النمل" to 27, "القصص" to 28, "العنكبوت" to 29, "الروم" to 30,
+        "لقمان" to 31, "السجدة" to 32, "الأحزاب" to 33, "سبأ" to 34, "فاطر" to 35, "يس" to 36, "الصافات" to 37, "ص" to 38, "الزمر" to 39, "غافر" to 40,
+        "فصلت" to 41, "الشورى" to 42, "الزخرف" to 43, "الدخان" to 44, "الجاثية" to 45, "الأحقاف" to 46, "محمد" to 47, "الفتح" to 48, "الحجرات" to 49, "ق" to 50,
+        "الذاريات" to 51, "الطور" to 52, "النجم" to 53, "القمر" to 54, "الرحمن" to 55, "الواقعة" to 56, "الحديد" to 57, "المجادلة" to 58, "الحشر" to 59, "الممتحنة" to 60,
+        "الصف" to 61, "الجمعة" to 62, "المنافقون" to 63, "التغابن" to 64, "الطلاق" to 65, "التحريم" to 66, "الملك" to 67, "القلم" to 68, "الحاقة" to 69, "المعارج" to 70,
+        "نوح" to 71, "الجن" to 72, "المزمل" to 73, "المدثر" to 74, "القيامة" to 75, "الانسان" to 76, "المرسلات" to 77, "النبأ" to 78, "النازعات" to 79, "التكوير" to 80,
+        "الانفطار" to 81, "المطففين" to 82, "الانشقاق" to 83, "البروج" to 84, "الطارق" to 85, "الأعلى" to 86, "الغاشية" to 87, "الفجر" to 88, "البلد" to 89, "الشمس" to 90,
+        "الليل" to 91, "الضحى" to 92, "الشرح" to 93, "التين" to 94, "العلق" to 95, "القدر" to 97, "البيّنة" to 98, "الزلزلة" to 99, "العاديات" to 100,
+        "القارعة" to 101, "التكاثر" to 102, "العصر" to 103, "الهمزة" to 104, "الفيل" to 105, "قريش" to 106, "الماعون" to 107, "الكوثر" to 108, "الكافرون" to 109, "النصر" to 110,
+        "المسد" to 111, "الإخلاص" to 112, "الفلق" to 113, "الناس" to 114
+    )
+
+    fun parseReferenceToAyahs(reference: String): Pair<Int, List<Int>>? {
+        try {
+            val normalizedRef = reference.trim()
+            var surahNum: Int? = null
+            for ((name, num) in surahMap) {
+                if (normalizedRef.contains(name)) {
+                    surahNum = num
+                    break
+                }
+            }
+            if (surahNum == null) return null
+            val ayahList = mutableListOf<Int>()
+            if (normalizedRef.contains("كامل") || normalizedRef.contains("كاملة")) {
+                val totalAyahs = when (surahNum) {
+                    1 -> 7
+                    97 -> 5
+                    112 -> 4
+                    113 -> 5
+                    114 -> 6
+                    else -> 10
+                }
+                for (i in 1..totalAyahs) {
+                    ayahList.add(i)
+                }
+            } else {
+                val numbers = Regex("\\d+").findAll(normalizedRef).map { it.value.toInt() }.toList()
+                if (numbers.size >= 2) {
+                    val start = numbers[0]
+                    val end = numbers[1]
+                    if (start <= end) {
+                        for (i in start..end) {
+                            ayahList.add(i)
+                        }
+                    } else {
+                        ayahList.add(start)
+                    }
+                } else if (numbers.size == 1) {
+                    ayahList.add(numbers[0])
+                } else {
+                    ayahList.add(1)
+                }
+            }
+            return Pair(surahNum, ayahList)
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    fun playQuranEntity(entity: IslamicContentEntity) {
+        if (entity.category != "quran") return
+        
+        if (currentAudioEntity.value?.id == entity.id) {
+            togglePlayPause()
+            return
+        }
+        
+        stopAudioInternal()
+        currentAudioEntity.value = entity
+        val parsed = parseReferenceToAyahs(entity.reference)
+        if (parsed == null) {
+            activeSurahNumber = 1
+            activeVerseNumbers = listOf(1)
+        } else {
+            activeSurahNumber = parsed.first
+            activeVerseNumbers = parsed.second
+        }
+        totalVersesInEntity.value = activeVerseNumbers.size
+        currentVerseIndex.value = 0
+        prepareAndPlayActiveVerse()
+    }
+
+    private fun prepareAndPlayActiveVerse() {
+        val surah = activeSurahNumber
+        val idx = currentVerseIndex.value
+        if (idx < 0 || idx >= activeVerseNumbers.size) {
+            stopAudioInternal()
+            return
+        }
+        val ayah = activeVerseNumbers[idx]
+        
+        val reciterFolder = selectedReciter.value.folder
+        val paddedSurah = String.format("%03d", surah)
+        val paddedAyah = String.format("%03d", ayah)
+        val url = "https://everyayah.com/data/$reciterFolder/$paddedSurah$paddedAyah.mp3"
+        playUrl(url)
+    }
+
+    private fun playUrl(url: String) {
+        isAudioBuffering.value = true
+        isAudioPlaying.value = false
+        audioPosition.value = 0
+        audioProgress.value = 0f
+        audioDuration.value = 1
+        
+        try {
+            if (mediaPlayer == null) {
+                mediaPlayer = MediaPlayer().apply {
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .build()
+                    )
+                }
+            } else {
+                mediaPlayer?.reset()
+            }
+            
+            mediaPlayer?.apply {
+                setDataSource(url)
+                setOnPreparedListener { mp ->
+                    isAudioBuffering.value = false
+                    isAudioPlaying.value = true
+                    audioDuration.value = mp.duration
+                    mp.start()
+                    startProgressTracking()
+                }
+                setOnCompletionListener {
+                    progressJob?.cancel()
+                    if (currentVerseIndex.value + 1 < activeVerseNumbers.size) {
+                        currentVerseIndex.value += 1
+                        prepareAndPlayActiveVerse()
+                    } else {
+                        stopAudioInternal()
                     }
                 }
-                return true
-            } else {
-                _importStatus.value = "عذراً، لم نتمكن من استخراج سجلات مفيدة. تأكد من مطابقة التنسيق (العنوان، النص، النوع، المصدر)."
-                _isImporting.value = false
-                return false
+                setOnErrorListener { _, what, extra ->
+                    Log.e("AudioPlayer", "Error playing audio from url: $url, what: $what, extra: $extra")
+                    isAudioBuffering.value = false
+                    isAudioPlaying.value = false
+                    stopAudioInternal()
+                    true
+                }
+                prepareAsync()
             }
         } catch (e: Exception) {
-            _importStatus.value = "فشل الاستيراد بسبب خطأ بنيوي: ${e.localizedMessage}"
-            _isImporting.value = false
-            return false
+            Log.e("AudioPlayer", "Exception in playUrl: ${e.message}", e)
+            isAudioBuffering.value = false
+            isAudioPlaying.value = false
+            stopAudioInternal()
+        }
+    }
+
+    private fun startProgressTracking() {
+        progressJob?.cancel()
+        progressJob = viewModelScope.launch(Dispatchers.Main) {
+            while (isAudioPlaying.value && mediaPlayer != null) {
+                try {
+                    val pos = mediaPlayer?.currentPosition ?: 0
+                    val dur = mediaPlayer?.duration ?: 1
+                    audioPosition.value = pos
+                    if (dur > 0) {
+                        audioDuration.value = dur
+                        audioProgress.value = pos.toFloat() / dur.toFloat()
+                    }
+                } catch (e: Exception) {
+                    // ignore
+                }
+                kotlinx.coroutines.delay(250)
+            }
+        }
+    }
+
+    fun togglePlayPause() {
+        val player = mediaPlayer ?: return
+        if (isAudioPlaying.value) {
+            player.pause()
+            isAudioPlaying.value = false
+            progressJob?.cancel()
+        } else {
+            if (!isAudioBuffering.value) {
+                player.start()
+                isAudioPlaying.value = true
+                startProgressTracking()
+            }
+        }
+    }
+
+    fun seekAudio(progressPercent: Float) {
+        val player = mediaPlayer ?: return
+        val dur = audioDuration.value
+        if (dur > 0) {
+            val targetMs = (progressPercent * dur).toInt()
+            try {
+                player.seekTo(targetMs)
+                audioPosition.value = targetMs
+                audioProgress.value = progressPercent
+            } catch (e: Exception) {
+                // Ignore
+            }
+        }
+    }
+
+    fun skipNext() {
+        if (currentVerseIndex.value + 1 < activeVerseNumbers.size) {
+            currentVerseIndex.value += 1
+            prepareAndPlayActiveVerse()
+        }
+    }
+
+    fun skipPrevious() {
+        if (currentVerseIndex.value > 0) {
+            currentVerseIndex.value -= 1
+            prepareAndPlayActiveVerse()
+        }
+    }
+
+    fun stopAudio() {
+        stopAudioInternal()
+        currentAudioEntity.value = null
+    }
+
+    private fun stopAudioInternal() {
+        progressJob?.cancel()
+        isAudioPlaying.value = false
+        isAudioBuffering.value = false
+        audioPosition.value = 0
+        audioProgress.value = 0f
+        try {
+            mediaPlayer?.stop()
+            mediaPlayer?.reset()
+        } catch (e: Exception) {
+            // Ignore
+        }
+    }
+
+    fun selectReciter(reciter: Reciter) {
+        selectedReciter.value = reciter
+        if (currentAudioEntity.value != null && (isAudioPlaying.value || isAudioBuffering.value)) {
+            prepareAndPlayActiveVerse()
+        }
+    }
+
+    fun getActiveVerseRawNumber(): Int? {
+        val idx = currentVerseIndex.value
+        return if (idx >= 0 && idx < activeVerseNumbers.size) activeVerseNumbers[idx] else null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        progressJob?.cancel()
+        try {
+            mediaPlayer?.release()
+            mediaPlayer = null
+        } catch (e: Exception) {
+            // Ignore
         }
     }
 }
+
+data class Reciter(
+    val id: String,
+    val nameAr: String,
+    val nameEn: String,
+    val folder: String
+)
+
+
+data class ScoredResult(
+    val entity: IslamicContentEntity,
+    val score: Double
+)

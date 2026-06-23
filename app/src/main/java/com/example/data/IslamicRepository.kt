@@ -1,100 +1,94 @@
 package com.example.data
 
-import com.example.nlp.ArabicNlpHelper
+import android.content.Context
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.first
+import java.io.File
 
-class IslamicRepository(private val dao: IslamicContentDao) {
+class IslamicRepository(
+    private val database: AppDatabase,
+    private val context: Context
+) {
+    private val dao = database.islamicContentDao()
 
     val allContent: Flow<List<IslamicContentEntity>> = dao.getAllContent()
-    val favorites: Flow<List<IslamicContentEntity>> = dao.getFavorites()
 
-    fun getContentByType(type: String): Flow<List<IslamicContentEntity>> {
-        return dao.getContentByType(type)
+    fun getContentByCategory(category: String): Flow<List<IslamicContentEntity>> {
+        return dao.getContentByCategory(category)
     }
 
-    suspend fun insert(content: IslamicContentEntity): Long {
-        return dao.insert(content)
+    suspend fun searchContent(query: String): List<IslamicContentEntity> {
+        return dao.searchContent(query)
     }
 
-    suspend fun update(content: IslamicContentEntity) {
-        dao.update(content)
+    suspend fun searchContentByCategory(category: String, query: String): List<IslamicContentEntity> {
+        return dao.searchContentByCategory(category, query)
+    }
+
+    suspend fun insertContent(item: IslamicContentEntity): Long {
+        return dao.insertContent(item)
+    }
+
+    suspend fun insertContentList(items: List<IslamicContentEntity>) {
+        dao.insertContentList(items)
     }
 
     suspend fun deleteById(id: Int) {
         dao.deleteById(id)
     }
 
-    /**
-     * Seeds initial database items if it is empty.
-     */
-    suspend fun checkAndSeedDatabase() {
-        if (dao.count() == 0) {
-            val seedList = IslamicInitialData.getSeedEntities()
-            dao.insertAll(seedList)
-        }
+    suspend fun deleteBySourceFile(sourceFile: String) {
+        dao.deleteBySourceFile(sourceFile)
     }
 
-    /**
-     * Runs our lightweight Offline Arabic Semantic Keyword Search.
-     * Combines SQL raw matching and local relevance-ranking calculations.
-     */
-    suspend fun performLocalSearch(query: String, typeFilter: String? = null): List<SearchResult> {
-        val queryTerms = ArabicNlpHelper.extractSearchTerms(query)
-        if (queryTerms.isEmpty()) {
-            // If the query was empty or only had stop words, return all items of that type (or absolute all)
-            val baseList = if (typeFilter != null && typeFilter != "all") {
-                dao.getContentByType(typeFilter).first()
-            } else {
-                dao.getAllContent().first()
+    suspend fun clearCategory(category: String) {
+        dao.clearCategory(category)
+    }
+
+    suspend fun clearAll() {
+        dao.clearAll()
+    }
+
+    // --- Bookmarks / Favorites Support ---
+    val allFavorites: Flow<List<IslamicContentEntity>> = dao.getFavoriteContent()
+
+    suspend fun insertFavorite(id: Int) {
+        dao.insertFavorite(FavoriteEntity(id))
+    }
+
+    suspend fun deleteFavorite(id: Int) {
+        dao.deleteFavoriteById(id)
+    }
+
+    suspend fun isFavorite(id: Int): Boolean {
+        return dao.isFavorite(id)
+    }
+
+    fun isFavoriteFlow(id: Int): Flow<Boolean> {
+        return dao.isFavoriteFlow(id)
+    }
+
+    // --- Quran Progress Tracker ---
+    val allQuranProgress: Flow<List<QuranProgressEntity>> = dao.getAllProgressFlow()
+
+    suspend fun insertOrUpdateProgress(progress: QuranProgressEntity) {
+        dao.insertOrUpdateProgress(progress)
+    }
+
+    suspend fun getProgressById(id: Int): QuranProgressEntity? {
+        return dao.getProgressById(id)
+    }
+
+    fun getProgressByIdFlow(id: Int): Flow<QuranProgressEntity?> {
+        return dao.getProgressByIdFlow(id)
+    }
+
+    suspend fun checkAndSeedDatabase() {
+        val initialList = IslamicInitialData.getInitialContent()
+        for (item in initialList) {
+            val existing = dao.getContentByTitleAndCategory(item.title, item.category)
+            if (existing == null) {
+                dao.insertContent(item)
             }
-            return baseList.map { SearchResult(it, 1.0) }
         }
-
-        // We fetch candidates matching ANY of the query terms to maintain speed and low RAM
-        val candidateSet = mutableSetOf<IslamicContentEntity>()
-        for (term in queryTerms) {
-            val localResults = dao.searchLocalRaw(term)
-            candidateSet.addAll(localResults)
-        }
-
-        // Failsafe: if the candidate set is empty, we do a scan over the entire local DB
-        // to ensure we capture any hidden semantic matching
-        if (candidateSet.isEmpty()) {
-            val allLocal = dao.getAllContent().first()
-            candidateSet.addAll(allLocal)
-        }
-
-        // Now calculate detailed scores for each matched candidate
-        val scoredList = candidateSet.mapNotNull { entity ->
-            // Filter by type if a specific category is requested
-            if (typeFilter != null && typeFilter != "all" && entity.type != typeFilter) {
-                return@mapNotNull null
-            }
-
-            val score = ArabicNlpHelper.calculateMatchScore(
-                normalizedQueryTerms = queryTerms,
-                normalizedTitle = entity.normalizedTitle,
-                normalizedText = entity.normalizedText,
-                keywordsCsv = entity.keywords
-            )
-
-            if (score > 0.0) {
-                SearchResult(entity, score)
-            } else {
-                null
-            }
-        }
-
-        // Sort descending by calculated match weight
-        return scoredList.sortedByDescending { it.score }
     }
 }
-
-/**
- * Encapsulates the matching search result along with its relevancy score
- */
-data class SearchResult(
-    val entity: IslamicContentEntity,
-    val score: Double
-)

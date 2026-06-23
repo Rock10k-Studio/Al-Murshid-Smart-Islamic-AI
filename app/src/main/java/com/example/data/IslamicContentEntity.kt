@@ -6,13 +6,10 @@ import androidx.room.PrimaryKey
 @Entity(tableName = "islamic_content")
 data class IslamicContentEntity(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
-    val type: String,               // "quran", "hadith", "fatwa", "adhkar"
-    val title: String,              // Head line or topic title
-    val text: String,               // Real text (with original Arabic script & harakat etc.)
-    val source: String,             // Sourced book or trusted website (e.g., صحيح البخاري, إسلام ويب)
-    val keywords: String,           // Comma-separated listing for semantic terms
-    val normalizedTitle: String,    // Prefiltered title (no diacritics, normalized characters)
-    val normalizedText: String,     // Prefiltered body (no diacritics, normalized characters)
-    val isFavorite: Boolean = false, // Saved marker
-    val timestamp: Long = System.currentTimeMillis() // Creation/Caching time
+    val title: String,
+    val content: String,
+    val category: String, // "quran", "hadith", "fatawa", "user_docs"
+    val reference: String, // E.g., "سورة البقرة: 183", "صحيح مسلم: 124"
+    val sourceFile: String? = null, // Path or name of the text/zip file
+    val dateAdded: Long = System.currentTimeMillis()
 )

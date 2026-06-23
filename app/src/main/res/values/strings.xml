@@ -1,3 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">المنارة للذكاء الإسلامي</string>
+    <string name="welcome_message">مرحباً بك في المنارة للذكاء الإسلامي</string>
+    <string name="quran_section">القرآن الكريم</string>
+    <string name="hadith_section">الحديث الشريف</string>
+    <string name="fatawa_section">الفتاوى والأحكام</string>
+    <string name="user_docs_section">المستندات الخاصة</string>
 </resources>
